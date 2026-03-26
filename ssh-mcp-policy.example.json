@@ -1,0 +1,42 @@
+{
+  "blockedCategories": [],
+  "approvalCategories": [
+    "session-state"
+  ],
+  "allowRules": [
+    {
+      "name": "allow-touch-probe",
+      "regex": "^touch /tmp/mcp_allow_probe$",
+      "decision": "approval_required",
+      "reason": "Permit this one scratch-file probe after explicit confirmation."
+    }
+  ],
+  "denyRules": [
+    {
+      "name": "block-service-restarts",
+      "regex": "\\b(systemctl|service)\\b.*\\b(start|stop|restart|reload)\\b",
+      "reason": "Prevent service interruption from the MCP server."
+    }
+  ],
+  "sqlPolicy": {
+    "blockedCategories": [],
+    "approvalCategories": [
+      "session-state"
+    ],
+    "allowRules": [
+      {
+        "name": "allow-current-schema-switch",
+        "regex": "^alter session set current_schema = NMS$",
+        "decision": "approval_required",
+        "reason": "Permit this one schema switch after explicit confirmation for NMS diagnostics."
+      }
+    ],
+    "denyRules": [
+      {
+        "name": "block-select-for-update",
+        "regex": "\\bfor\\s+update\\b",
+        "reason": "Prevent lock-taking SQL from the MCP server."
+      }
+    ]
+  }
+}

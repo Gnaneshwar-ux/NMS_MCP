@@ -1,0 +1,7 @@
+dist/
+node_modules/
+.codex-ssh/
+mcp-audit.ndjson
+smoke-result.json
+.env
+.env.*

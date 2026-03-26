@@ -1,0 +1,16 @@
+{
+  "blockedCategories": [],
+  "approvalCategories": [
+    "session-state"
+  ],
+  "allowRules": [],
+  "denyRules": [],
+  "sqlPolicy": {
+    "blockedCategories": [],
+    "approvalCategories": [
+      "session-state"
+    ],
+    "allowRules": [],
+    "denyRules": []
+  }
+}

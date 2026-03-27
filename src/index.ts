@@ -216,7 +216,7 @@ const TOOL_DEFINITIONS = [
         dbSessionId: { type: "string" },
         sql: { type: "string" },
         binds: {
-          oneOf: [{ type: "object" }, { type: "array" }],
+          oneOf: [{ type: "object" }, { type: "array", items: {} }],
         },
         maxRows: { type: "integer", default: DEFAULT_DB_MAX_ROWS },
         timeout: { type: "integer", default: DEFAULT_DB_TIMEOUT_MS },
@@ -498,6 +498,10 @@ function createApprovalId(): string {
   return randomUUID().split("-")[0]?.toUpperCase() ?? "APPROVAL";
 }
 
+function normalizeApprovalText(value: string): string {
+  return value.replace(/\s+/g, " ").trim();
+}
+
 function toPendingApprovalSummary(pendingApproval?: PendingApproval): Record<string, unknown> | null {
   if (!pendingApproval) {
     return null;
@@ -522,10 +526,11 @@ function createOrReusePendingApproval(
   summary: string,
 ): PendingApproval {
   const now = Date.now();
+  const normalizedCommand = normalizeApprovalText(command);
   const existing = session.pendingApproval;
   if (
     existing &&
-    existing.command === command &&
+    existing.command === normalizedCommand &&
     existing.riskLevel === riskLevel &&
     existing.requiredConfirmationToken === requiredConfirmationToken &&
     existing.expiresAt > now
@@ -535,7 +540,7 @@ function createOrReusePendingApproval(
 
   const pendingApproval: PendingApproval = {
     approvalId: createApprovalId(),
-    command,
+    command: normalizedCommand,
     riskLevel,
     requiredConfirmationToken,
     summary,
@@ -612,7 +617,7 @@ function ensureCommandApproval(
   }
 
   if (!review.requiresConfirmation || !review.requiredConfirmationToken) {
-    if (session.pendingApproval?.command === command) {
+    if (session.pendingApproval?.command === review.normalizedCommand) {
       session.pendingApproval = undefined;
     }
 
@@ -625,7 +630,7 @@ function ensureCommandApproval(
 
   const pendingApproval = createOrReusePendingApproval(
     session,
-    command,
+    review.normalizedCommand,
     review.riskLevel,
     review.requiredConfirmationToken,
     review.summary,
@@ -721,10 +726,11 @@ function createOrReusePendingSqlApproval(
   summary: string,
 ): PendingSqlApproval {
   const now = Date.now();
+  const normalizedSql = normalizeApprovalText(sql);
   const existing = session.pendingApproval;
   if (
     existing &&
-    existing.sql === sql &&
+    existing.sql === normalizedSql &&
     existing.riskLevel === riskLevel &&
     existing.requiredConfirmationToken === requiredConfirmationToken &&
     existing.expiresAt > now
@@ -734,7 +740,7 @@ function createOrReusePendingSqlApproval(
 
   const pendingApproval: PendingSqlApproval = {
     approvalId: createApprovalId(),
-    sql,
+    sql: normalizedSql,
     riskLevel,
     requiredConfirmationToken,
     summary,
@@ -813,7 +819,7 @@ function ensureSqlApproval(
   }
 
   if (!review.requiresConfirmation || !review.requiredConfirmationToken) {
-    if (session.pendingApproval?.sql === sql) {
+    if (session.pendingApproval?.sql === review.normalizedSql) {
       session.pendingApproval = undefined;
     }
 
@@ -827,7 +833,7 @@ function ensureSqlApproval(
 
   const pendingApproval = createOrReusePendingSqlApproval(
     session,
-    sql,
+    review.normalizedSql,
     review.riskLevel,
     review.requiredConfirmationToken,
     review.summary,

@@ -15,6 +15,7 @@ import {
   closeOracleSession,
   connectOracleSession,
   executeSql,
+  interruptOracleExecution,
 } from "./db.js";
 import {
   DbSessionManager,
@@ -291,6 +292,20 @@ const TOOL_DEFINITIONS = [
       required: ["dbSessionId"],
       properties: {
         dbSessionId: { type: "string" },
+      },
+    },
+  },
+  {
+    name: "interrupt_db_session",
+    description:
+      "Attempts to interrupt the currently running SQL statement on a cached Oracle DB session and optionally waits for the session to become idle again.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["dbSessionId"],
+      properties: {
+        dbSessionId: { type: "string" },
+        waitForIdleMs: { type: "integer", default: 5000 },
       },
     },
   },
@@ -1355,11 +1370,18 @@ async function callExecuteSql(
   } catch (error) {
     if (error instanceof HandledError) {
       let dbSessionClosed = false;
-      if (error.code === "TIMEOUT" && error.details["sessionReusable"] === false) {
+      if (
+        (error.code === "TIMEOUT" || error.code === "INTERRUPTED") &&
+        error.details["sessionReusable"] === false
+      ) {
+        const closeReason =
+          error.code === "TIMEOUT"
+            ? "Closed after SQL timeout left the Oracle DB connection unusable."
+            : "Closed after SQL interruption left the Oracle DB connection unusable.";
         await closeBrokenOracleSession(
           session,
           dbSessionManager,
-          "Closed after SQL timeout left the Oracle DB connection unusable.",
+          closeReason,
         );
         dbSessionClosed = true;
         error.details["dbSessionClosed"] = true;
@@ -1367,19 +1389,28 @@ async function callExecuteSql(
         sessionManager.recordAudit({
           level: "warning",
           event: "db_session_closed",
-          message: "Closed Oracle DB session after an unrecoverable SQL timeout.",
+          message:
+            error.code === "TIMEOUT"
+              ? "Closed Oracle DB session after an unrecoverable SQL timeout."
+              : "Closed Oracle DB session after an unrecoverable SQL interruption.",
           sessionId: session.id,
           host: session.connectTarget,
           username: session.username,
           details: {
-            reason: "Closed after SQL timeout left the Oracle DB connection unusable.",
+            reason: closeReason,
           },
         });
       }
 
       sessionManager.recordAudit({
-        level: error.code === "TIMEOUT" ? "warning" : "error",
-        event: error.code === "TIMEOUT" ? "sql_timed_out" : "sql_failed",
+        level:
+          error.code === "TIMEOUT" || error.code === "INTERRUPTED" ? "warning" : "error",
+        event:
+          error.code === "TIMEOUT"
+            ? "sql_timed_out"
+            : error.code === "INTERRUPTED"
+              ? "sql_interrupted"
+              : "sql_failed",
         message: error.message,
         sessionId: session.id,
         host: session.connectTarget,
@@ -1527,6 +1558,63 @@ async function callCloseDbSession(
   };
 }
 
+async function callInterruptDbSession(
+  args: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  const dbSessionId = readString(args, "dbSessionId", true) ?? "";
+  const waitForIdleMs = readPositiveInteger(args, "waitForIdleMs", 5000);
+  const session = dbSessionManager.require(dbSessionId);
+
+  const result = await interruptOracleExecution(session, {
+    waitForIdleMs,
+  });
+
+  let dbSessionClosed = false;
+  if (
+    result.interruptedExecution &&
+    !result.sessionBusy &&
+    result.sessionReusable === false
+  ) {
+    await closeBrokenOracleSession(
+      session,
+      dbSessionManager,
+      "Closed after SQL interruption left the Oracle DB connection unusable.",
+    );
+    dbSessionClosed = true;
+  }
+
+  sessionManager.recordAudit({
+    level: "warning",
+    event: "db_session_interrupted",
+    message: result.interruptedExecution
+      ? "Requested interruption of the active Oracle DB statement."
+      : "Interrupt requested for an idle Oracle DB session.",
+    sessionId: session.id,
+    host: session.connectTarget,
+    username: session.username,
+    details: {
+      waitForIdleMs,
+      interruptedExecution: result.interruptedExecution,
+      sessionBusy: result.sessionBusy,
+      waitTimedOut: result.waitTimedOut,
+      sessionReusable: result.sessionReusable,
+      dbSessionClosed,
+      sql: result.sql,
+      driverMessage: result.driverMessage ?? null,
+    },
+  });
+
+  return {
+    interrupted: result.interruptedExecution,
+    sessionBusy: result.sessionBusy,
+    waitTimedOut: result.waitTimedOut,
+    sessionReusable: result.sessionReusable,
+    dbSessionClosed,
+    dbSessionId: session.id,
+    sql: result.sql,
+  };
+}
+
 function buildServer() {
   const server = new McpServer(
     {
@@ -1584,6 +1672,8 @@ function buildServer() {
         return await safeToolCall(() => callCloseSession(args));
       case "close_db_session":
         return await safeToolCall(() => callCloseDbSession(args));
+      case "interrupt_db_session":
+        return await safeToolCall(() => callInterruptDbSession(args));
       case "interrupt_session":
         return await safeToolCall(() => callInterruptSession(args));
       default:

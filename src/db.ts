@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import oracledb from "oracledb";
 
 import type { DbSessionManager, OracleDbSession } from "./db-session.js";
-import { getErrorMessage, HandledError } from "./utils.js";
+import { getErrorMessage, HandledError, sleep } from "./utils.js";
 
 const DEFAULT_DB_STMT_CACHE_SIZE = 30;
 
@@ -45,6 +45,15 @@ export interface ExecuteSqlResult {
   timedOut: boolean;
   transactionInProgress: boolean;
   warning?: string;
+}
+
+export interface InterruptSqlResult {
+  interruptedExecution: boolean;
+  sessionBusy: boolean;
+  waitTimedOut: boolean;
+  sessionReusable: boolean;
+  sql: string | null;
+  driverMessage?: string;
 }
 
 function trimOptional(value: string | undefined): string | undefined {
@@ -133,6 +142,20 @@ function isOracleExecutionTimeout(message: string): boolean {
 
 export function isOracleConnectionUnusable(message: string): boolean {
   return /DPI-1080/i.test(message);
+}
+
+function getBreakFunction(
+  connection: { break?: () => Promise<void>; breakExecution?: () => Promise<void> },
+): (() => Promise<void>) | undefined {
+  if (typeof connection.breakExecution === "function") {
+    return connection.breakExecution.bind(connection);
+  }
+
+  if (typeof connection.break === "function") {
+    return connection.break.bind(connection);
+  }
+
+  return undefined;
 }
 
 function normalizeSessionSnapshot(session: OracleDbSession): void {
@@ -326,16 +349,18 @@ export async function executeSql(
   session.connection.callTimeout = Math.max(1, options.timeoutMs);
 
   try {
+    const executeOptions = {
+      outFormat: oracledb.OUT_FORMAT_OBJECT,
+      autoCommit: false,
+      maxRows: options.maxRows,
+      fetchArraySize: Math.min(options.maxRows, 200),
+      prefetchRows: Math.min(options.maxRows, 200),
+    };
+    const bindParams = options.binds ?? {};
     const result = await session.connection.execute(
       options.sql,
-      options.binds,
-      {
-        outFormat: oracledb.OUT_FORMAT_OBJECT,
-        autoCommit: false,
-        maxRows: options.maxRows,
-        fetchArraySize: Math.min(options.maxRows, 200),
-        prefetchRows: Math.min(options.maxRows, 200),
-      },
+      bindParams,
+      executeOptions,
     );
 
     normalizeSessionSnapshot(session);
@@ -354,6 +379,19 @@ export async function executeSql(
     normalizeSessionSnapshot(session);
     const message = getErrorMessage(error);
     const executionMs = Date.now() - session.activeExecution.startedAt;
+    const interruptedByUser = Boolean(session.activeExecution.interruptRequestedAt);
+
+    if (interruptedByUser && isOracleExecutionTimeout(message)) {
+      throw new HandledError(
+        "INTERRUPTED",
+        "SQL execution was interrupted.",
+        {
+          executionMs,
+          sessionReusable: !isOracleConnectionUnusable(message),
+          driverMessage: message,
+        },
+      );
+    }
 
     if (isOracleExecutionTimeout(message)) {
       throw new HandledError(
@@ -378,6 +416,75 @@ export async function executeSql(
     session.connection.callTimeout = previousTimeout;
     session.activeExecution = undefined;
     session.lastUsedAt = Date.now();
+  }
+}
+
+export async function interruptOracleExecution(
+  session: OracleDbSession,
+  options: { waitForIdleMs: number },
+): Promise<InterruptSqlResult> {
+  const activeExecution = session.activeExecution;
+  if (!activeExecution) {
+    session.lastUsedAt = Date.now();
+    return {
+      interruptedExecution: false,
+      sessionBusy: false,
+      waitTimedOut: false,
+      sessionReusable: true,
+      sql: null,
+    };
+  }
+
+  const breakExecution = getBreakFunction(session.connection);
+  if (!breakExecution) {
+    throw new HandledError(
+      "DB_INTERRUPT_UNSUPPORTED",
+      "This Oracle driver connection does not expose a supported statement interrupt method.",
+    );
+  }
+
+  activeExecution.interruptRequestedAt = Date.now();
+  const interruptedSql = activeExecution.sql;
+  await breakExecution();
+
+  const waitDeadline = Date.now() + Math.max(1, options.waitForIdleMs);
+  while (session.activeExecution && Date.now() < waitDeadline) {
+    await sleep(50);
+  }
+
+  const sessionBusy = Boolean(session.activeExecution);
+  if (sessionBusy) {
+    session.lastUsedAt = Date.now();
+    return {
+      interruptedExecution: true,
+      sessionBusy: true,
+      waitTimedOut: true,
+      sessionReusable: true,
+      sql: interruptedSql,
+    };
+  }
+
+  try {
+    await session.connection.ping();
+    normalizeSessionSnapshot(session);
+    session.lastUsedAt = Date.now();
+    return {
+      interruptedExecution: true,
+      sessionBusy: false,
+      waitTimedOut: false,
+      sessionReusable: true,
+      sql: interruptedSql,
+    };
+  } catch (error) {
+    session.lastUsedAt = Date.now();
+    return {
+      interruptedExecution: true,
+      sessionBusy: false,
+      waitTimedOut: false,
+      sessionReusable: false,
+      sql: interruptedSql,
+      driverMessage: getErrorMessage(error),
+    };
   }
 }
 

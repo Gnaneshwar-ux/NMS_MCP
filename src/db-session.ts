@@ -18,6 +18,7 @@ export interface ActiveSqlExecution {
   sql: string;
   startedAt: number;
   timeoutMs: number;
+  interruptRequestedAt?: number;
 }
 
 export interface OracleDbSession {

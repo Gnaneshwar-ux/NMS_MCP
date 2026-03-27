@@ -53,6 +53,8 @@ declare module "oracledb" {
       bindParams?: Record<string, unknown> | unknown[],
       options?: ExecuteOptions,
     ): Promise<ExecuteResult<T>>;
+    break(): Promise<void>;
+    breakExecution(): Promise<void>;
     close(): Promise<void>;
     ping(): Promise<void>;
     commit(): Promise<void>;

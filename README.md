@@ -84,6 +84,7 @@ Oracle DB tools:
 - `execute_sql`
 - `list_db_sessions`
 - `close_db_session`
+- `interrupt_db_session`
 
 Shared visibility:
 

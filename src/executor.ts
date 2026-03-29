@@ -1,7 +1,11 @@
 import { maybeAdoptInteractiveShell } from "./shell-state.js";
 import { setSessionIdentity, type ShellSession } from "./session.js";
 
-import { maybeInjectSudoPassword, updateSessionSudoState } from "./sudo.js";
+import {
+  maybeInjectSudoPassword,
+  rewriteSudoCommandWithPassword,
+  updateSessionSudoState,
+} from "./sudo.js";
 import {
   cleanCommandOutput,
   detectShellPrompt,
@@ -98,7 +102,8 @@ function beginCommand(
 ): { sentinelId: string; startedAt: number } {
   const sentinelId = generateSentinel();
   const startedAt = Date.now();
-  const submittedCommand = buildWrappedCommand(command, sentinelId);
+  const preparedCommand = rewriteSudoCommandWithPassword(command, options.sudoPassword);
+  const submittedCommand = buildWrappedCommand(preparedCommand.rewrittenCommand, sentinelId);
 
   session.activeCommand = {
     command,
@@ -108,9 +113,10 @@ function beginCommand(
     startedAt,
     timeoutMs: options.timeoutMs,
     buffer: "",
-    sudoPassword: options.sudoPassword,
+    sudoPassword: preparedCommand.usesPromptInjection ? options.sudoPassword : undefined,
     sudoPromptAttempts: 0,
     lastSudoPromptBufferLength: 0,
+    lastSudoPromptSignature: undefined,
     completed: false,
     timedOutReported: false,
     stripAnsiOutput: options.stripAnsiOutput,

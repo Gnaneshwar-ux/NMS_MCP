@@ -4,6 +4,8 @@ import assert from "node:assert/strict";
 import { createFakeSession } from "./helpers.js";
 import {
   inferShellIdentityTransition,
+  maybeInjectSudoPassword,
+  rewriteSudoCommandWithPassword,
   updateSessionSudoState,
 } from "../dist/sudo.js";
 
@@ -47,4 +49,52 @@ test("tracks shell identity on exit back to the login user", () => {
   assert.equal(session.identity.effectiveUser, "test");
   assert.equal(session.identity.privilegeMode, "standard");
   assert.equal(session.isSudo, false);
+});
+
+test("injects the sudo password only once for the same visible prompt", () => {
+  const { session, writes } = createFakeSession();
+  const activeCommand = {
+    command: "sudo -k ls /root",
+    submittedCommand: "sudo -k ls /root\n",
+    executionMode: "oneshot",
+    sentinelId: "sentinel",
+    startedAt: Date.now(),
+    timeoutMs: 30_000,
+    buffer: "[sudo] password for test: ",
+    sudoPassword: "Oracle1234",
+    sudoPromptAttempts: 0,
+    lastSudoPromptBufferLength: 0,
+    lastSudoPromptSignature: undefined,
+    completed: false,
+    timedOutReported: false,
+    stripAnsiOutput: true,
+  };
+
+  maybeInjectSudoPassword(session, activeCommand);
+  assert.deepEqual(writes, ["Oracle1234\n"]);
+
+  activeCommand.buffer += "\nOracle1234";
+  maybeInjectSudoPassword(session, activeCommand);
+  assert.deepEqual(writes, ["Oracle1234\n"]);
+  assert.equal(activeCommand.sudoPromptAttempts, 1);
+});
+
+test("rewrites direct sudo commands to use sudo -S when a password is supplied", () => {
+  const result = rewriteSudoCommandWithPassword(
+    "sudo -k ls /root | head -n 5",
+    "Oracle1234",
+  );
+
+  assert.equal(result.usesPromptInjection, false);
+  assert.match(result.rewrittenCommand, /^printf '%s\\n' 'Oracle1234' \| sudo -S -p '' -k ls \/root \| head -n 5$/);
+});
+
+test("keeps shell-elevating sudo flows on prompt injection", () => {
+  const result = rewriteSudoCommandWithPassword(
+    "sudo -iu oracle",
+    "Oracle1234",
+  );
+
+  assert.equal(result.usesPromptInjection, true);
+  assert.equal(result.rewrittenCommand, "sudo -iu oracle");
 });

@@ -63,6 +63,7 @@ export interface ActiveCommandState {
   sudoPassword?: string;
   sudoPromptAttempts: number;
   lastSudoPromptBufferLength: number;
+  lastSudoPromptSignature?: string;
   completed: boolean;
   completedAt?: number;
   exitCode?: number;
@@ -297,6 +298,7 @@ export class SessionManager {
     if (includeActiveCommand && session.activeCommand) {
       session.activeCommand.buffer = "";
       session.activeCommand.lastSudoPromptBufferLength = 0;
+      session.activeCommand.lastSudoPromptSignature = undefined;
     }
     session.lastUsedAt = Date.now();
   }

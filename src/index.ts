@@ -24,6 +24,7 @@ import {
 } from "./db-session.js";
 import {
   executeCommand,
+  handleShellData,
   interruptSession,
   startInteractiveCommand,
   waitForCommandActivity,
@@ -858,6 +859,8 @@ async function waitForPotentialShellAdoption(
   session: ShellSession,
   waitWindowMs: number,
 ) {
+  handleShellData(session);
+
   let adoption = await maybeAdoptInteractiveShell(session, Math.max(waitWindowMs, 1500));
   if (adoption.adopted || !session.activeCommand) {
     return adoption;

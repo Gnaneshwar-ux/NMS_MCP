@@ -4,10 +4,14 @@ import {
   type ShellPrivilegeMode,
   type ShellSession,
 } from "./session.js";
+import { stripAnsiPreserveWhitespace } from "./utils.js";
 
-const SUDO_PROMPT_PATTERNS = [/\[sudo\] password/i, /password for .+:/i];
 const MAX_SUDO_PROMPT_ATTEMPTS = 3;
 const SHELL_EXIT_PATTERN = /^\s*(?:exit|logout)\s*$/i;
+const SUDO_PROMPT_AT_END_PATTERNS = [
+  /\[sudo\] password(?: for [^:\n]+)?:\s*$/i,
+  /password for [^:\n]+:\s*$/i,
+];
 
 export interface ShellIdentityTransition {
   adoptsShell: boolean;
@@ -19,6 +23,10 @@ export interface ShellIdentityTransition {
 
 function normalizeCommand(command: string): string {
   return command.replace(/\s+/g, " ").trim();
+}
+
+function escapeSingleQuoted(value: string): string {
+  return value.replace(/'/g, `'\\''`);
 }
 
 function tokenize(command: string): string[] {
@@ -118,6 +126,40 @@ export function inferShellIdentityTransition(command: string): ShellIdentityTran
   return inferSuTransition(command) ?? inferSudoTransition(command);
 }
 
+export function rewriteSudoCommandWithPassword(
+  command: string,
+  sudoPassword?: string,
+): {
+  rewrittenCommand: string;
+  usesPromptInjection: boolean;
+} {
+  if (!sudoPassword || inferShellIdentityTransition(command)) {
+    return {
+      rewrittenCommand: command,
+      usesPromptInjection: Boolean(sudoPassword),
+    };
+  }
+
+  const sudoPrefixPattern =
+    /^\s*((?:[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|[^\s]+)\s+)*)sudo\b/i;
+  const sudoPrefixMatch = command.match(sudoPrefixPattern);
+  if (!sudoPrefixMatch) {
+    return {
+      rewrittenCommand: command,
+      usesPromptInjection: Boolean(sudoPassword),
+    };
+  }
+
+  const envPrefix = sudoPrefixMatch[1] ?? "";
+  const rest = command.slice(sudoPrefixMatch[0].length);
+  const escapedPassword = escapeSingleQuoted(sudoPassword);
+
+  return {
+    rewrittenCommand: `${envPrefix}printf '%s\\n' '${escapedPassword}' | sudo -S -p ''${rest}`,
+    usesPromptInjection: false,
+  };
+}
+
 export function maybeInjectSudoPassword(
   session: ShellSession,
   activeCommand: ActiveCommandState,
@@ -126,10 +168,17 @@ export function maybeInjectSudoPassword(
     return;
   }
 
-  const tail = activeCommand.buffer.slice(-256);
+  const strippedTail = stripAnsiPreserveWhitespace(activeCommand.buffer).slice(-256);
+  const promptMatch = SUDO_PROMPT_AT_END_PATTERNS.map((pattern) => strippedTail.match(pattern)).find(Boolean);
+  const promptSignature = promptMatch?.[0]?.trim();
+
+  if (!promptSignature) {
+    return;
+  }
+
   if (
-    activeCommand.buffer.length === activeCommand.lastSudoPromptBufferLength ||
-    !SUDO_PROMPT_PATTERNS.some((pattern) => pattern.test(tail))
+    activeCommand.buffer.length === activeCommand.lastSudoPromptBufferLength &&
+    activeCommand.lastSudoPromptSignature === promptSignature
   ) {
     return;
   }
@@ -138,6 +187,7 @@ export function maybeInjectSudoPassword(
   // answer sudo is directly in the active channel the moment the prompt appears.
   activeCommand.sudoPromptAttempts += 1;
   activeCommand.lastSudoPromptBufferLength = activeCommand.buffer.length;
+  activeCommand.lastSudoPromptSignature = promptSignature;
   session.shell.write(`${activeCommand.sudoPassword}\n`);
 }
 

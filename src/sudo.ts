@@ -25,8 +25,18 @@ function normalizeCommand(command: string): string {
   return command.replace(/\s+/g, " ").trim();
 }
 
-function escapeSingleQuoted(value: string): string {
-  return value.replace(/'/g, `'\\''`);
+function chooseHereDocDelimiter(value: string): string {
+  let delimiter = "__MCP_SUDO_PASSWORD__";
+  while (
+    value === delimiter ||
+    value.startsWith(`${delimiter}\n`) ||
+    value.endsWith(`\n${delimiter}`) ||
+    value.includes(`\n${delimiter}\n`)
+  ) {
+    delimiter = `${delimiter}_X`;
+  }
+
+  return delimiter;
 }
 
 function tokenize(command: string): string[] {
@@ -152,10 +162,10 @@ export function rewriteSudoCommandWithPassword(
 
   const envPrefix = sudoPrefixMatch[1] ?? "";
   const rest = command.slice(sudoPrefixMatch[0].length);
-  const escapedPassword = escapeSingleQuoted(sudoPassword);
+  const delimiter = chooseHereDocDelimiter(sudoPassword);
 
   return {
-    rewrittenCommand: `${envPrefix}printf '%s\\n' '${escapedPassword}' | sudo -S -p ''${rest}`,
+    rewrittenCommand: `cat <<'${delimiter}' | ${envPrefix}sudo -S -p ''${rest}\n${sudoPassword}\n${delimiter}`,
     usesPromptInjection: false,
   };
 }

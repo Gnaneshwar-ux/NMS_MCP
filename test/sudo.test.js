@@ -86,7 +86,11 @@ test("rewrites direct sudo commands to use sudo -S when a password is supplied",
   );
 
   assert.equal(result.usesPromptInjection, false);
-  assert.match(result.rewrittenCommand, /^printf '%s\\n' 'Oracle1234' \| sudo -S -p '' -k ls \/root \| head -n 5$/);
+  assert.match(
+    result.rewrittenCommand,
+    /^cat <<'__MCP_SUDO_PASSWORD__' \| sudo -S -p '' -k ls \/root \| head -n 5\nOracle1234\n__MCP_SUDO_PASSWORD__$/,
+  );
+  assert.doesNotMatch(result.rewrittenCommand, /printf '%s\\n'/);
 });
 
 test("keeps shell-elevating sudo flows on prompt injection", () => {

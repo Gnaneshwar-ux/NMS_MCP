@@ -6,6 +6,7 @@ import type { Client, ClientChannel } from "ssh2";
 import { HandledError } from "./utils.js";
 
 export type CommandRiskLevel = "read-only" | "mutating" | "destructive";
+export type ShellPrivilegeMode = "standard" | "sudo" | "su" | "root";
 
 export interface PendingApproval {
   approvalId: string;
@@ -71,6 +72,31 @@ export interface ActiveCommandState {
   stripAnsiOutput: boolean;
 }
 
+export interface ShellIdentity {
+  loginUser: string;
+  effectiveUser: string;
+  privilegeMode: ShellPrivilegeMode;
+  promptMarkerActive: boolean;
+  source: "login" | "bootstrap" | "inferred";
+  lastDetectedAt: number;
+}
+
+export interface ShellBootstrapState {
+  successful: boolean;
+  lastBootstrapAt?: number;
+  lastBootstrapReason?: string;
+  lastBootstrapError?: string;
+  lastReadyMarker?: string;
+  recoveryCount: number;
+  adoptedShellCount: number;
+}
+
+export interface SessionOperationState {
+  activeLabel?: string;
+  activeSince?: number;
+  queuedCount: number;
+}
+
 export interface ShellSession {
   id: string;
   client: Client;
@@ -90,6 +116,10 @@ export interface ShellSession {
   closing: boolean;
   closeReason?: string;
   manualMode: boolean;
+  identity: ShellIdentity;
+  bootstrap: ShellBootstrapState;
+  operationState: SessionOperationState;
+  operationChain?: Promise<void>;
   activeCommand?: ActiveCommandState;
   pendingApproval?: PendingApproval;
 }
@@ -99,6 +129,107 @@ interface SessionManagerOptions {
   maxSessions: number;
   closeSession: (session: ShellSession, reason: string) => void;
   auditLogFilePath?: string | null;
+}
+
+export function createInitialShellIdentity(loginUser: string): ShellIdentity {
+  return {
+    loginUser,
+    effectiveUser: loginUser,
+    privilegeMode: "standard",
+    promptMarkerActive: false,
+    source: "login",
+    lastDetectedAt: Date.now(),
+  };
+}
+
+export function setSessionIdentity(
+  session: ShellSession,
+  update: Partial<Omit<ShellIdentity, "loginUser">> & { loginUser?: string },
+): ShellIdentity {
+  const nextIdentity: ShellIdentity = {
+    ...session.identity,
+    ...update,
+    loginUser: update.loginUser ?? session.identity.loginUser,
+    lastDetectedAt: Date.now(),
+  };
+
+  session.identity = nextIdentity;
+  session.isSudo = nextIdentity.privilegeMode !== "standard";
+  return nextIdentity;
+}
+
+export function recordShellBootstrap(
+  session: ShellSession,
+  reason: string,
+  readyMarker: string,
+  recovered = false,
+): void {
+  session.bootstrap = {
+    ...session.bootstrap,
+    successful: true,
+    lastBootstrapAt: Date.now(),
+    lastBootstrapReason: reason,
+    lastBootstrapError: undefined,
+    lastReadyMarker: readyMarker,
+    recoveryCount: session.bootstrap.recoveryCount + (recovered ? 1 : 0),
+  };
+}
+
+export function recordShellBootstrapFailure(
+  session: ShellSession,
+  reason: string,
+  errorMessage: string,
+): void {
+  session.bootstrap = {
+    ...session.bootstrap,
+    successful: false,
+    lastBootstrapReason: reason,
+    lastBootstrapError: errorMessage,
+  };
+}
+
+export function recordShellAdoption(session: ShellSession): void {
+  session.bootstrap = {
+    ...session.bootstrap,
+    adoptedShellCount: session.bootstrap.adoptedShellCount + 1,
+  };
+}
+
+export async function runExclusiveShellOperation<T>(
+  session: ShellSession,
+  label: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const previous = session.operationChain ?? Promise.resolve();
+  let release: (() => void) | undefined;
+  const current = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const currentTail = previous.catch(() => undefined).then(() => current);
+
+  session.operationChain = currentTail;
+  session.operationState.queuedCount += 1;
+
+  await previous.catch(() => undefined);
+
+  session.operationState.queuedCount = Math.max(0, session.operationState.queuedCount - 1);
+  session.operationState.activeLabel = label;
+  session.operationState.activeSince = Date.now();
+
+  try {
+    return await operation();
+  } finally {
+    session.operationState.activeLabel = undefined;
+    session.operationState.activeSince = undefined;
+
+    if (release) {
+      release();
+    }
+
+    if (session.operationChain === currentTail) {
+      session.operationChain = undefined;
+    }
+  }
 }
 
 export class SessionManager {
@@ -263,7 +394,11 @@ export class SessionManager {
     session.ready = false;
     session.closing = true;
     session.closeReason = reason;
+    session.operationState.activeLabel = undefined;
+    session.operationState.activeSince = undefined;
+    session.operationState.queuedCount = 0;
     session.pendingApproval = undefined;
+    session.identity.promptMarkerActive = false;
 
     if (session.activeCommand && !session.activeCommand.completed) {
       session.activeCommand.closedReason = reason;

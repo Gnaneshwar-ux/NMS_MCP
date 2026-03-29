@@ -36,11 +36,14 @@ import {
 import { reviewCommandPolicy } from "./policy.js";
 import {
   SessionManager,
+  runExclusiveShellOperation,
   type PendingApproval,
   type ShellSession,
 } from "./session.js";
+import { maybeAdoptInteractiveShell } from "./shell-state.js";
 import { closeShellSession, connectShellSession, type AuthMethod } from "./ssh.js";
 import { reviewSqlPolicy } from "./sql-policy.js";
+import { inferShellIdentityTransition } from "./sudo.js";
 import {
   analyzeInteractionPrompt,
   cleanShellOutput,
@@ -826,7 +829,58 @@ function buildInteractionState(
     bufferLength: sourceBuffer.length,
     sessionReady: session.ready,
     isSudo: session.isSudo,
+    sessionIdentity: {
+      loginUser: session.identity.loginUser,
+      effectiveUser: session.identity.effectiveUser,
+      privilegeMode: session.identity.privilegeMode,
+      promptMarkerActive: session.identity.promptMarkerActive,
+      source: session.identity.source,
+      lastDetectedAt: session.identity.lastDetectedAt,
+    },
+    bootstrap: {
+      successful: session.bootstrap.successful,
+      lastBootstrapAt: session.bootstrap.lastBootstrapAt ?? null,
+      lastBootstrapReason: session.bootstrap.lastBootstrapReason ?? null,
+      lastBootstrapError: session.bootstrap.lastBootstrapError ?? null,
+      lastReadyMarker: session.bootstrap.lastReadyMarker ?? null,
+      recoveryCount: session.bootstrap.recoveryCount,
+      adoptedShellCount: session.bootstrap.adoptedShellCount,
+    },
+    operation: {
+      activeLabel: session.operationState.activeLabel ?? null,
+      activeSince: session.operationState.activeSince ?? null,
+      queuedCount: session.operationState.queuedCount,
+    },
   };
+}
+
+async function waitForPotentialShellAdoption(
+  session: ShellSession,
+  waitWindowMs: number,
+) {
+  let adoption = await maybeAdoptInteractiveShell(session, Math.max(waitWindowMs, 1500));
+  if (adoption.adopted || !session.activeCommand) {
+    return adoption;
+  }
+
+  if (!inferShellIdentityTransition(session.activeCommand.command)) {
+    return adoption;
+  }
+
+  const deadline = Date.now() + Math.max(waitWindowMs, 0);
+  let previousLength = session.activeCommand.buffer.length;
+
+  while (Date.now() < deadline && session.activeCommand && !session.activeCommand.completed) {
+    const remainingMs = deadline - Date.now();
+    await waitForCommandActivity(session, previousLength, Math.min(remainingMs, 300));
+    previousLength = session.activeCommand?.buffer.length ?? previousLength;
+    adoption = await maybeAdoptInteractiveShell(session, Math.min(Math.max(remainingMs, 1), 1500));
+    if (adoption.adopted) {
+      return adoption;
+    }
+  }
+
+  return adoption;
 }
 
 function toSessionSummary(session: ShellSession): Record<string, unknown> {
@@ -841,6 +895,9 @@ function toSessionSummary(session: ShellSession): Record<string, unknown> {
     lastUsedAt: session.lastUsedAt,
     isSudo: session.isSudo,
     ready: session.ready,
+    sessionIdentity: interaction["sessionIdentity"],
+    bootstrap: interaction["bootstrap"],
+    operation: interaction["operation"],
     pendingApproval: toPendingApprovalSummary(session.pendingApproval),
     interaction: {
       sessionMode: interaction["sessionMode"],
@@ -1091,6 +1148,20 @@ async function callSshConnect(args: Record<string, unknown>): Promise<Record<str
     host: session.host,
     username: session.username,
     connected: true,
+    sessionIdentity: {
+      loginUser: session.identity.loginUser,
+      effectiveUser: session.identity.effectiveUser,
+      privilegeMode: session.identity.privilegeMode,
+      promptMarkerActive: session.identity.promptMarkerActive,
+      source: session.identity.source,
+    },
+    bootstrap: {
+      successful: session.bootstrap.successful,
+      lastBootstrapAt: session.bootstrap.lastBootstrapAt ?? null,
+      lastBootstrapReason: session.bootstrap.lastBootstrapReason ?? null,
+      recoveryCount: session.bootstrap.recoveryCount,
+      adoptedShellCount: session.bootstrap.adoptedShellCount,
+    },
     ...(session.serverBanner ? { serverBanner: session.serverBanner } : {}),
   };
 }
@@ -1106,36 +1177,13 @@ async function callExecuteCommand(
   const approvalId = readString(args, "approvalId");
   const userConfirmation = readString(args, "userConfirmation");
   const session = sessionManager.require(sessionId);
-  const policy = ensureCommandApproval(session, command, approvalId, userConfirmation);
-
-  sessionManager.recordAudit({
-    level: "info",
-    event: "command_started",
-    message: `Started ${policy.riskLevel} command execution.`,
-    sessionId: session.id,
-    host: session.host,
-    username: session.username,
-    command,
-    riskLevel: policy.riskLevel,
-    details: {
-      category: policy.category,
-      timeoutMs,
-      confirmationUsed: Boolean(userConfirmation),
-      executionMode: "oneshot",
-    },
-  });
-
-  try {
-    const result = await executeCommand(session, command, {
-      timeoutMs,
-      sudoPassword,
-      stripAnsiOutput: stripAnsi,
-    });
+  return await runExclusiveShellOperation(session, "execute_command", async () => {
+    const policy = ensureCommandApproval(session, command, approvalId, userConfirmation);
 
     sessionManager.recordAudit({
       level: "info",
-      event: "command_completed",
-      message: `Completed command with exit code ${result.exitCode}.`,
+      event: "command_started",
+      message: `Started ${policy.riskLevel} command execution.`,
       sessionId: session.id,
       host: session.host,
       username: session.username,
@@ -1143,30 +1191,23 @@ async function callExecuteCommand(
       riskLevel: policy.riskLevel,
       details: {
         category: policy.category,
-        exitCode: result.exitCode,
-        executionMs: result.executionMs,
+        timeoutMs,
+        confirmationUsed: Boolean(userConfirmation),
         executionMode: "oneshot",
       },
     });
 
-    return {
-      ...result,
-      interaction: buildInteractionState(session, stripAnsi),
-      policy: {
-        riskLevel: policy.riskLevel,
-        category: policy.category,
-      },
-    };
-  } catch (error) {
-    if (error instanceof HandledError) {
-      if (error.code === "TIMEOUT") {
-        error.details["interaction"] = buildInteractionState(session, stripAnsi);
-      }
+    try {
+      const result = await executeCommand(session, command, {
+        timeoutMs,
+        sudoPassword,
+        stripAnsiOutput: stripAnsi,
+      });
 
       sessionManager.recordAudit({
-        level: error.code === "TIMEOUT" ? "warning" : "error",
-        event: error.code === "TIMEOUT" ? "command_timed_out" : "command_failed",
-        message: error.message,
+        level: "info",
+        event: "command_completed",
+        message: `Completed command with exit code ${result.exitCode}.`,
         sessionId: session.id,
         host: session.host,
         username: session.username,
@@ -1174,14 +1215,46 @@ async function callExecuteCommand(
         riskLevel: policy.riskLevel,
         details: {
           category: policy.category,
+          exitCode: result.exitCode,
+          executionMs: result.executionMs,
           executionMode: "oneshot",
-          ...error.details,
         },
       });
-    }
 
-    throw error;
-  }
+      return {
+        ...result,
+        interaction: buildInteractionState(session, stripAnsi),
+        policy: {
+          riskLevel: policy.riskLevel,
+          category: policy.category,
+        },
+      };
+    } catch (error) {
+      if (error instanceof HandledError) {
+        if (error.code === "TIMEOUT") {
+          error.details["interaction"] = buildInteractionState(session, stripAnsi);
+        }
+
+        sessionManager.recordAudit({
+          level: error.code === "TIMEOUT" ? "warning" : "error",
+          event: error.code === "TIMEOUT" ? "command_timed_out" : "command_failed",
+          message: error.message,
+          sessionId: session.id,
+          host: session.host,
+          username: session.username,
+          command,
+          riskLevel: policy.riskLevel,
+          details: {
+            category: policy.category,
+            executionMode: "oneshot",
+            ...error.details,
+          },
+        });
+      }
+
+      throw error;
+    }
+  });
 }
 
 async function callStartInteractiveCommand(
@@ -1196,84 +1269,88 @@ async function callStartInteractiveCommand(
   const approvalId = readString(args, "approvalId");
   const userConfirmation = readString(args, "userConfirmation");
   const session = sessionManager.require(sessionId);
-  const policy = ensureCommandApproval(session, command, approvalId, userConfirmation);
+  return await runExclusiveShellOperation(session, "start_interactive_command", async () => {
+    const policy = ensureCommandApproval(session, command, approvalId, userConfirmation);
 
-  sessionManager.recordAudit({
-    level: "info",
-    event: "command_started",
-    message: `Started ${policy.riskLevel} interactive command execution.`,
-    sessionId: session.id,
-    host: session.host,
-    username: session.username,
-    command,
-    riskLevel: policy.riskLevel,
-    details: {
-      category: policy.category,
-      timeoutMs,
-      waitForOutputMs,
-      confirmationUsed: Boolean(userConfirmation),
-      executionMode: "interactive",
-    },
-  });
-
-  try {
-    const result = await startInteractiveCommand(session, command, {
-      timeoutMs,
-      waitForOutputMs,
-      sudoPassword,
-      stripAnsiOutput: stripAnsi,
+    sessionManager.recordAudit({
+      level: "info",
+      event: "command_started",
+      message: `Started ${policy.riskLevel} interactive command execution.`,
+      sessionId: session.id,
+      host: session.host,
+      username: session.username,
+      command,
+      riskLevel: policy.riskLevel,
+      details: {
+        category: policy.category,
+        timeoutMs,
+        waitForOutputMs,
+        confirmationUsed: Boolean(userConfirmation),
+        executionMode: "interactive",
+      },
     });
 
-    if (result.completed) {
-      sessionManager.recordAudit({
-        level: "info",
-        event: "command_completed",
-        message: `Completed interactive command with exit code ${result.exitCode ?? 0}.`,
-        sessionId: session.id,
-        host: session.host,
-        username: session.username,
-        command,
-        riskLevel: policy.riskLevel,
-        details: {
-          category: policy.category,
-          exitCode: result.exitCode ?? 0,
-          executionMs: result.executionMs,
-          executionMode: "interactive",
-        },
+    try {
+      const result = await startInteractiveCommand(session, command, {
+        timeoutMs,
+        waitForOutputMs,
+        sudoPassword,
+        stripAnsiOutput: stripAnsi,
       });
-    }
+      const interaction = buildInteractionState(session, stripAnsi);
 
-    return {
-      ...result,
-      interaction: buildInteractionState(session, stripAnsi),
-      policy: {
-        riskLevel: policy.riskLevel,
-        category: policy.category,
-      },
-    };
-  } catch (error) {
-    if (error instanceof HandledError) {
-      error.details["interaction"] = buildInteractionState(session, stripAnsi);
+      if (result.completed) {
+        sessionManager.recordAudit({
+          level: "info",
+          event: "command_completed",
+          message: `Completed interactive command with exit code ${result.exitCode ?? 0}.`,
+          sessionId: session.id,
+          host: session.host,
+          username: session.username,
+          command,
+          riskLevel: policy.riskLevel,
+          details: {
+            category: policy.category,
+            exitCode: result.exitCode ?? 0,
+            executionMs: result.executionMs,
+            executionMode: "interactive",
+          },
+        });
+      }
 
-      sessionManager.recordAudit({
-        level: "error",
-        event: "command_failed",
-        message: error.message,
-        sessionId: session.id,
-        host: session.host,
-        username: session.username,
-        command,
-        riskLevel: policy.riskLevel,
-        details: {
+      return {
+        ...result,
+        shellAdopted: !result.completed && !session.activeCommand && session.ready,
+        interaction,
+        policy: {
+          riskLevel: policy.riskLevel,
           category: policy.category,
-          executionMode: "interactive",
-          ...error.details,
         },
-      });
-    }
+      };
+    } catch (error) {
+      if (error instanceof HandledError) {
+        error.details["interaction"] = buildInteractionState(session, stripAnsi);
 
-    throw error;
-  }
+        sessionManager.recordAudit({
+          level: "error",
+          event: "command_failed",
+          message: error.message,
+          sessionId: session.id,
+          host: session.host,
+          username: session.username,
+          command,
+          riskLevel: policy.riskLevel,
+          details: {
+            category: policy.category,
+            executionMode: "interactive",
+            ...error.details,
+          },
+        });
+      }
+
+      throw error;
+    }
+  });
 }
 
 function writeInputToSession(
@@ -1344,11 +1421,13 @@ async function callWriteStdin(
   const redactInput = readBoolean(args, "redactInput", false);
   const session = sessionManager.require(sessionId);
   const decodedInput = decodeInputEscapes(input);
-  writeInputToSession(session, decodedInput, {
-    redactInput,
-  });
+  return await runExclusiveShellOperation(session, "write_stdin", async () => {
+    writeInputToSession(session, decodedInput, {
+      redactInput,
+    });
 
-  return { written: true };
+    return { written: true };
+  });
 }
 
 async function callSendInteractionInput(
@@ -1361,27 +1440,34 @@ async function callSendInteractionInput(
   const redactInput = readBoolean(args, "redactInput", false);
   const session = sessionManager.require(sessionId);
 
-  if ((session.activeCommand && session.activeCommand.completed) || (!session.activeCommand && !session.manualMode)) {
-    throw new HandledError(
-      "NO_ACTIVE_INTERACTION",
-      "There is no active interactive PTY command to receive follow-up input.",
-    );
-  }
+  return await runExclusiveShellOperation(session, "send_interaction_input", async () => {
+    if ((session.activeCommand && session.activeCommand.completed) || (!session.activeCommand && !session.manualMode)) {
+      throw new HandledError(
+        "NO_ACTIVE_INTERACTION",
+        "There is no active interactive PTY command to receive follow-up input.",
+      );
+    }
 
-  const decodedInput = decodeInputEscapes(input);
-  const previousLength = session.activeCommand?.buffer.length ?? session.buffer.length;
-  writeInputToSession(session, decodedInput, {
-    redactInput,
+    const decodedInput = decodeInputEscapes(input);
+    const previousLength = session.activeCommand?.buffer.length ?? session.buffer.length;
+    writeInputToSession(session, decodedInput, {
+      redactInput,
+    });
+
+    if (waitForOutputMs > 0) {
+      await waitForCommandActivity(session, previousLength, waitForOutputMs);
+    }
+
+    const adoption = await waitForPotentialShellAdoption(session, waitForOutputMs);
+
+    return {
+      written: true,
+      shellAdopted: adoption.adopted,
+      adoptedEffectiveUser: adoption.effectiveUser,
+      ...(adoption.adoptionError ? { adoptionError: adoption.adoptionError } : {}),
+      interaction: buildInteractionState(session, stripAnsi),
+    };
   });
-
-  if (waitForOutputMs > 0) {
-    await waitForCommandActivity(session, previousLength, waitForOutputMs);
-  }
-
-  return {
-    written: true,
-    interaction: buildInteractionState(session, stripAnsi),
-  };
 }
 
 async function callReviewCommand(
@@ -1453,35 +1539,37 @@ async function callInterruptSession(
     );
   }
 
-  const result = await interruptSession(session, {
-    signal: signalValue as "ctrlC" | "ctrlD" | "newline",
-    waitForReadyMs,
-    clearBuffer,
-  });
-
-  sessionManager.recordAudit({
-    level: "warning",
-    event: "session_interrupted",
-    message: `Sent ${signalValue} to recover the PTY session.`,
-    sessionId: session.id,
-    host: session.host,
-    username: session.username,
-    details: {
-      signal: signalValue,
+  return await runExclusiveShellOperation(session, "interrupt_session", async () => {
+    const result = await interruptSession(session, {
+      signal: signalValue as "ctrlC" | "ctrlD" | "newline",
       waitForReadyMs,
       clearBuffer,
+    });
+
+    sessionManager.recordAudit({
+      level: "warning",
+      event: "session_interrupted",
+      message: `Sent ${signalValue} to recover the PTY session.`,
+      sessionId: session.id,
+      host: session.host,
+      username: session.username,
+      details: {
+        signal: signalValue,
+        waitForReadyMs,
+        clearBuffer,
+        sessionReady: result.sessionReady,
+        clearedActiveCommand: result.clearedActiveCommand,
+      },
+    });
+
+    return {
+      interrupted: true,
       sessionReady: result.sessionReady,
       clearedActiveCommand: result.clearedActiveCommand,
-    },
+      bufferLength: session.buffer.length,
+      interaction: buildInteractionState(session, true),
+    };
   });
-
-  return {
-    interrupted: true,
-    sessionReady: result.sessionReady,
-    clearedActiveCommand: result.clearedActiveCommand,
-    bufferLength: session.buffer.length,
-    interaction: buildInteractionState(session, true),
-  };
 }
 
 async function callReadOutput(
@@ -1491,6 +1579,7 @@ async function callReadOutput(
   const clear = readBoolean(args, "clear", false);
   const stripAnsi = readBoolean(args, "stripAnsi", true);
   const session = sessionManager.require(sessionId);
+  await waitForPotentialShellAdoption(session, 500);
   const interaction = buildInteractionState(session, stripAnsi);
 
   if (clear) {
@@ -1514,6 +1603,7 @@ async function callReadInteractionState(
   const clear = readBoolean(args, "clear", false);
   const stripAnsi = readBoolean(args, "stripAnsi", true);
   const session = sessionManager.require(sessionId);
+  await waitForPotentialShellAdoption(session, 500);
   const interaction = buildInteractionState(session, stripAnsi);
 
   if (clear) {
@@ -1533,12 +1623,14 @@ async function callResizeTerminal(
   const rows = readPositiveInteger(args, "rows", DEFAULT_TERMINAL_ROWS);
   const session = sessionManager.require(sessionId);
 
-  session.shell.setWindow(rows, cols, 0, 0);
-  session.cols = cols;
-  session.rows = rows;
-  session.lastUsedAt = Date.now();
+  return await runExclusiveShellOperation(session, "resize_terminal", async () => {
+    session.shell.setWindow(rows, cols, 0, 0);
+    session.cols = cols;
+    session.rows = rows;
+    session.lastUsedAt = Date.now();
 
-  return { resized: true };
+    return { resized: true };
+  });
 }
 
 async function callListSessions(): Promise<Record<string, unknown>> {

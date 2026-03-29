@@ -5,7 +5,12 @@ import { Client, type ClientChannel, type ConnectConfig } from "ssh2";
 import { v4 as uuidv4 } from "uuid";
 
 import { handleShellData } from "./executor.js";
-import type { SessionManager, ShellSession } from "./session.js";
+import { bootstrapShell } from "./shell-state.js";
+import {
+  createInitialShellIdentity,
+  type SessionManager,
+  type ShellSession,
+} from "./session.js";
 import {
   appendRollingBuffer,
   cleanInitialBanner,
@@ -14,9 +19,6 @@ import {
   DEFAULT_TERMINAL_ROWS,
   getErrorMessage,
   HandledError,
-  SHELL_PROMPT_MARKER,
-  SHELL_READY_MARKER_PREFIX,
-  sleep,
 } from "./utils.js";
 
 export type AuthMethod = "password" | "privateKey" | "agent";
@@ -309,39 +311,6 @@ function attachSessionListeners(session: ShellSession, sessionManager: SessionMa
   });
 }
 
-async function initializeShell(session: ShellSession, timeoutMs: number): Promise<string> {
-  const readyMarker = `${SHELL_READY_MARKER_PREFIX}${Date.now()}_${Math.floor(Math.random() * 1000)}`;
-  const setupLine =
-    `stty -echo 2>/dev/null || true; ` +
-    `bind 'set enable-bracketed-paste off' 2>/dev/null || true; ` +
-    `export PS1='${SHELL_PROMPT_MARKER} '; ` +
-    `export PS2=''; ` +
-    `PROMPT_COMMAND=; echo "${readyMarker}"`;
-  const startedAt = Date.now();
-
-  session.shell.write(`${setupLine}\n`);
-
-  while (Date.now() - startedAt < timeoutMs) {
-    if (session.closed) {
-      throw new HandledError(
-        "CONNECT_TIMEOUT",
-        session.closeReason ?? "The remote shell closed before startup completed.",
-      );
-    }
-
-    if (session.buffer.includes(readyMarker)) {
-      return session.buffer;
-    }
-
-    await sleep(50);
-  }
-
-  throw new HandledError(
-    "CONNECT_TIMEOUT",
-    `Timed out waiting for the remote PTY shell to become ready after ${timeoutMs}ms.`,
-  );
-}
-
 async function createReadyConnection(options: ConnectShellOptions): Promise<ReadyConnection> {
   const { client, serverBanner } = await connectClient(options);
 
@@ -381,12 +350,22 @@ export async function connectShellSession(options: ConnectShellOptions): Promise
     closed: false,
     closing: false,
     manualMode: false,
+    identity: createInitialShellIdentity(options.username),
+    bootstrap: {
+      successful: false,
+      recoveryCount: 0,
+      adoptedShellCount: 0,
+    },
+    operationState: {
+      queuedCount: 0,
+    },
   };
 
   attachSessionListeners(session, options.sessionManager);
 
   try {
-    const startupOutput = await initializeShell(session, options.connectTimeout);
+    await bootstrapShell(session, options.connectTimeout, "initial-connect");
+    const startupOutput = session.buffer;
     const initialBanner = cleanInitialBanner(startupOutput);
     const combinedBanner = [readyConnection.serverBanner, initialBanner]
       .filter((value) => Boolean(value && value.trim()))

@@ -9,6 +9,7 @@ export type InteractionPromptType =
   | "shell_prompt"
   | "sudo_password"
   | "password"
+  | "text_prompt"
   | "yes_no"
   | "press_enter"
   | "python_repl"
@@ -171,6 +172,26 @@ export function analyzeInteractionPrompt(
   }
 
   if (
+    /(?:^|\n)\s*(?:name|username|user|email|value|choice|selection|input|enter [^:\n]+):\s*$/i.test(
+      strippedTail,
+    ) ||
+    /(?:^|\n)\s*login:\s*$/i.test(strippedTail)
+  ) {
+    suggestions.push({
+      input: "<text>\\n",
+      description: "Provide the requested text input followed by Enter.",
+    });
+    return {
+      promptType: "text_prompt",
+      promptText: lastLine || "input:",
+      confidence: "medium",
+      expectsInput: true,
+      safeToAutoRespond: false,
+      suggestions,
+    };
+  }
+
+  if (
     /\b(?:\[y\/n\]|\[yes\/no\]|\[y\/N\]|\[Y\/n\]|\(y\/n\)|\(yes\/no\)|yes\/no)\b/i.test(
       strippedTail,
     ) ||
@@ -303,9 +324,17 @@ export function analyzeInteractionPrompt(
   };
 }
 
+export function hasPromptMarker(buffer: string): boolean {
+  return stripAnsiPreserveWhitespace(buffer).slice(-200).includes(`${SHELL_PROMPT_MARKER} `);
+}
+
 export function detectShellPrompt(buffer: string): boolean {
   const tail = stripAnsiPreserveWhitespace(buffer).slice(-200);
-  return tail.includes(`${SHELL_PROMPT_MARKER} `) || /(?:^|\n)[^\n]*[#$] ?$/.test(tail);
+  return (
+    hasPromptMarker(tail) ||
+    /(?:^|\n)[^\n]*[#$] ?$/.test(tail) ||
+    /(?:^|\n)[A-Za-z0-9._-]+@[A-Za-z0-9._:-]+>\s?$/.test(tail)
+  );
 }
 
 function removeInternalLines(output: string): string {

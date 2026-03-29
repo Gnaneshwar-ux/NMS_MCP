@@ -1,4 +1,5 @@
-import type { ShellSession } from "./session.js";
+import { maybeAdoptInteractiveShell } from "./shell-state.js";
+import { setSessionIdentity, type ShellSession } from "./session.js";
 
 import { maybeInjectSudoPassword, updateSessionSudoState } from "./sudo.js";
 import {
@@ -6,6 +7,7 @@ import {
   detectShellPrompt,
   escapeRegExp,
   generateSentinel,
+  hasPromptMarker,
   HandledError,
   SHELL_PROMPT_MARKER,
   sleep,
@@ -153,6 +155,10 @@ function maybeFinalizeActiveCommand(session: ShellSession): void {
       session.activeCommand = undefined;
       session.ready = true;
       session.manualMode = false;
+      setSessionIdentity(session, {
+        promptMarkerActive: hasPromptMarker(session.buffer),
+        source: session.identity.source,
+      });
     }
 
     return;
@@ -187,6 +193,10 @@ export function handleShellData(session: ShellSession): void {
   if (!session.ready && detectShellPrompt(session.buffer)) {
     session.ready = true;
     session.manualMode = false;
+    setSessionIdentity(session, {
+      promptMarkerActive: hasPromptMarker(session.buffer),
+      source: session.identity.source,
+    });
   }
 }
 
@@ -385,9 +395,23 @@ export async function startInteractiveCommand(
     await waitForCommandActivity(session, baselineOutputLength, options.waitForOutputMs);
   }
 
+  const adoption = await maybeAdoptInteractiveShell(
+    session,
+    Math.max(options.waitForOutputMs, 1500),
+  );
   const activeCommand = session.activeCommand;
   const completed = Boolean(activeCommand?.completed);
   const executionMs = Date.now() - startedAt;
+
+  if (adoption.adopted) {
+    return {
+      stdout: adoption.stdout,
+      started: true,
+      completed: false,
+      exitCode: null,
+      executionMs,
+    };
+  }
 
   if (completed && activeCommand) {
     const stdout = activeCommand.output ?? cleanActiveCommandOutput(session);

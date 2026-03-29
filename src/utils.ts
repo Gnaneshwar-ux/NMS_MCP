@@ -325,7 +325,8 @@ export function analyzeInteractionPrompt(
 }
 
 export function hasPromptMarker(buffer: string): boolean {
-  return stripAnsiPreserveWhitespace(buffer).slice(-200).includes(`${SHELL_PROMPT_MARKER} `);
+  const tail = stripAnsiPreserveWhitespace(buffer).slice(-200);
+  return new RegExp(`(?:^|\\n)${escapeRegExp(SHELL_PROMPT_MARKER)}\\s*$`).test(tail);
 }
 
 export function detectShellPrompt(buffer: string): boolean {

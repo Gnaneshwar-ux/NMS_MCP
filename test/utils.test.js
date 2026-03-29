@@ -41,6 +41,18 @@ test("detects managed shell prompts distinctly from fallback prompts", () => {
   assert.equal(detectShellPrompt(anglePrompt), true);
 });
 
+test("does not treat stale managed prompt markers as an active shell prompt", () => {
+  const staleManagedPrompt = `welcome\n${SHELL_PROMPT_MARKER} \n127.0.0.1 localhost`;
+  const prompt = analyzeInteractionPrompt(staleManagedPrompt, {
+    sessionReady: true,
+  });
+
+  assert.equal(hasPromptMarker(staleManagedPrompt), false);
+  assert.equal(detectShellPrompt(staleManagedPrompt), false);
+  assert.equal(prompt.promptType, "none");
+  assert.equal(prompt.expectsInput, false);
+});
+
 test("handles yes-no and press-enter prompt families", () => {
   const yesNo = analyzeInteractionPrompt("Proceed with restart? yes/no");
   const pressEnter = analyzeInteractionPrompt("Press Enter to continue");

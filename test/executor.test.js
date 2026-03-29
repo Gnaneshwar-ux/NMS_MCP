@@ -32,3 +32,33 @@ test("clears a timed-out active command when the shell prompt is already back", 
   assert.equal(session.manualMode, false);
   assert.equal(session.identity.promptMarkerActive, true);
 });
+
+test("does not clear a timed-out active command from a stale prompt marker", () => {
+  const { session } = createFakeSession({
+    ready: false,
+    buffer: "output line\n__MCP_PROMPT__ \n127.0.0.1 localhost",
+    activeCommand: {
+      command: "tail -n 3 -f /etc/hosts",
+      submittedCommand: "tail -n 3 -f /etc/hosts\n",
+      executionMode: "oneshot",
+      sentinelId: "sentinel",
+      startedAt: Date.now(),
+      timeoutMs: 1_500,
+      buffer: "127.0.0.1 localhost\n",
+      sudoPromptAttempts: 0,
+      lastSudoPromptBufferLength: 0,
+      lastSudoPromptSignature: undefined,
+      completed: false,
+      timedOutReported: true,
+      stripAnsiOutput: true,
+    },
+  });
+
+  handleShellData(session);
+
+  assert.notEqual(session.activeCommand, undefined);
+  assert.equal(session.activeCommand?.command, "tail -n 3 -f /etc/hosts");
+  assert.equal(session.ready, false);
+  assert.equal(session.manualMode, false);
+  assert.equal(session.identity.promptMarkerActive, false);
+});

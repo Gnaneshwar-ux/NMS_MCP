@@ -4,6 +4,36 @@ export const DEFAULT_BUFFER_LIMIT = 200_000;
 export const SHELL_PROMPT_MARKER = "__MCP_PROMPT__";
 export const SHELL_READY_MARKER_PREFIX = "__MCP_READY__";
 
+export type InteractionPromptType =
+  | "none"
+  | "shell_prompt"
+  | "sudo_password"
+  | "password"
+  | "yes_no"
+  | "press_enter"
+  | "python_repl"
+  | "sql_prompt"
+  | "isql_prompt"
+  | "sqlplus_prompt"
+  | "pager"
+  | "command_continuation"
+  | "unknown_interactive";
+
+export interface InteractionSuggestion {
+  input: string;
+  description: string;
+  sensitive?: boolean;
+}
+
+export interface InteractionPromptAnalysis {
+  promptType: InteractionPromptType;
+  promptText: string | null;
+  confidence: "low" | "medium" | "high";
+  expectsInput: boolean;
+  safeToAutoRespond: boolean;
+  suggestions: InteractionSuggestion[];
+}
+
 let sentinelCounter = 0;
 
 export class HandledError extends Error {
@@ -36,8 +66,8 @@ export function stripAnsiPreserveWhitespace(output: string): string {
   return normalizeNewlines(
     output
       .replace(/\x1B\][^\x07]*(\x07|\x1B\\)/g, "")
-      .replace(/\x1B\[[0-9;]*[mGKHF]/g, ""),
-  );
+      .replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, ""),
+  ).replace(/[\x00-\x08\x0B-\x1A\x1C-\x1F\x7F]/g, "");
 }
 
 export function stripAnsi(output: string): string {
@@ -75,6 +105,204 @@ export function decodeInputEscapes(input: string): string {
     .replace(/\\n/g, "\n");
 }
 
+function getTailLines(buffer: string, maxChars = 4000): string[] {
+  return stripAnsiPreserveWhitespace(buffer)
+    .slice(-maxChars)
+    .split("\n");
+}
+
+function getLastMeaningfulLine(buffer: string): string {
+  return (
+    getTailLines(buffer)
+      .map((line) => line.replace(/\s+$/, ""))
+      .filter((line) => line.length > 0)
+      .at(-1) ?? ""
+  );
+}
+
+export function analyzeInteractionPrompt(
+  buffer: string,
+  options: {
+    commandHint?: string;
+    sessionReady?: boolean;
+  } = {},
+): InteractionPromptAnalysis {
+  const strippedTail = stripAnsiPreserveWhitespace(buffer).slice(-4000);
+  const lastLine = getLastMeaningfulLine(buffer);
+  const commandHint = String(options.commandHint ?? "").toLowerCase();
+  const suggestions: InteractionSuggestion[] = [];
+
+  if (
+    /\[sudo\] password(?: for [^:\n]+)?:\s*$/i.test(strippedTail) ||
+    /\[sudo\] password(?: for [^:\n]+)?:\s*$/i.test(lastLine)
+  ) {
+    suggestions.push({
+      input: "<sudo password>\\n",
+      description: "Provide the sudo password followed by Enter.",
+      sensitive: true,
+    });
+    return {
+      promptType: "sudo_password",
+      promptText: lastLine || "[sudo] password:",
+      confidence: "high",
+      expectsInput: true,
+      safeToAutoRespond: false,
+      suggestions,
+    };
+  }
+
+  if (
+    /\bpassword(?: for [^:\n]+)?:\s*$/i.test(strippedTail) ||
+    /\bpassphrase(?: for [^:\n]+)?:\s*$/i.test(strippedTail)
+  ) {
+    suggestions.push({
+      input: "<secret>\\n",
+      description: "Provide the requested password or passphrase followed by Enter.",
+      sensitive: true,
+    });
+    return {
+      promptType: "password",
+      promptText: lastLine || "password:",
+      confidence: "high",
+      expectsInput: true,
+      safeToAutoRespond: false,
+      suggestions,
+    };
+  }
+
+  if (
+    /\b(?:\[y\/n\]|\[yes\/no\]|\[y\/N\]|\[Y\/n\]|\(y\/n\)|\(yes\/no\)|yes\/no)\b/i.test(
+      strippedTail,
+    ) ||
+    /\?\s*$/.test(lastLine) && /\b(?:proceed|continue|overwrite|replace|confirm|retry)\b/i.test(lastLine)
+  ) {
+    suggestions.push(
+      {
+        input: "yes\\n",
+        description: "Affirm the prompt.",
+      },
+      {
+        input: "no\\n",
+        description: "Decline the prompt.",
+      },
+    );
+    return {
+      promptType: "yes_no",
+      promptText: lastLine || "yes/no prompt",
+      confidence: "medium",
+      expectsInput: true,
+      safeToAutoRespond: false,
+      suggestions,
+    };
+  }
+
+  if (/\b(?:press|hit)\s+(?:enter|return)\b|\bpress any key\b|\bcontinue\b.*\benter\b/i.test(strippedTail)) {
+    suggestions.push({
+      input: "\\n",
+      description: "Press Enter to continue.",
+    });
+    return {
+      promptType: "press_enter",
+      promptText: lastLine || "Press Enter to continue",
+      confidence: "high",
+      expectsInput: true,
+      safeToAutoRespond: true,
+      suggestions,
+    };
+  }
+
+  if (/(?:^|\n)>>> $/.test(strippedTail) || /(?:^|\n)\.\.\. $/.test(strippedTail)) {
+    return {
+      promptType: "python_repl",
+      promptText: lastLine || ">>>",
+      confidence: "high",
+      expectsInput: true,
+      safeToAutoRespond: false,
+      suggestions,
+    };
+  }
+
+  if (/(?:^|\n)SQL>\s*$/.test(strippedTail)) {
+    const promptType =
+      commandHint.includes("isql") ? "isql_prompt" : commandHint.includes("sqlplus") ? "sqlplus_prompt" : "sql_prompt";
+    return {
+      promptType,
+      promptText: "SQL>",
+      confidence: "high",
+      expectsInput: true,
+      safeToAutoRespond: false,
+      suggestions,
+    };
+  }
+
+  if (/--More--|\(END\)\s*$|:\s*$/.test(lastLine) && /\b(?:more|less)\b/i.test(strippedTail)) {
+    suggestions.push(
+      {
+        input: " ",
+        description: "Advance one pager page.",
+      },
+      {
+        input: "q",
+        description: "Quit the pager.",
+      },
+      {
+        input: "\\n",
+        description: "Advance one line in the pager.",
+      },
+    );
+    return {
+      promptType: "pager",
+      promptText: lastLine || "pager prompt",
+      confidence: "medium",
+      expectsInput: true,
+      safeToAutoRespond: false,
+      suggestions,
+    };
+  }
+
+  if (/(?:^|\n)> $/.test(strippedTail) && !detectShellPrompt(strippedTail)) {
+    return {
+      promptType: "command_continuation",
+      promptText: lastLine || ">",
+      confidence: "medium",
+      expectsInput: true,
+      safeToAutoRespond: false,
+      suggestions,
+    };
+  }
+
+  if (detectShellPrompt(buffer)) {
+    return {
+      promptType: "shell_prompt",
+      promptText: lastLine || SHELL_PROMPT_MARKER,
+      confidence: options.sessionReady ? "high" : "medium",
+      expectsInput: true,
+      safeToAutoRespond: false,
+      suggestions,
+    };
+  }
+
+  if (/[>:] ?$/.test(lastLine) && lastLine.length > 0) {
+    return {
+      promptType: "unknown_interactive",
+      promptText: lastLine,
+      confidence: "low",
+      expectsInput: true,
+      safeToAutoRespond: false,
+      suggestions,
+    };
+  }
+
+  return {
+    promptType: "none",
+    promptText: null,
+    confidence: "low",
+    expectsInput: false,
+    safeToAutoRespond: false,
+    suggestions,
+  };
+}
+
 export function detectShellPrompt(buffer: string): boolean {
   const tail = stripAnsiPreserveWhitespace(buffer).slice(-200);
   return tail.includes(`${SHELL_PROMPT_MARKER} `) || /(?:^|\n)[^\n]*[#$] ?$/.test(tail);
@@ -96,7 +324,7 @@ function removePromptMarkers(output: string): string {
 
 export function cleanShellOutput(output: string, stripOutput = true): string {
   const cleaned = removePromptMarkers(output);
-  return stripOutput ? stripAnsi(cleaned) : normalizeNewlines(cleaned).trim();
+  return stripOutput ? stripAnsi(cleaned) : stripAnsiPreserveWhitespace(cleaned).trim();
 }
 
 function stripEchoedCommandPrefix(output: string, command: string): string {
@@ -152,7 +380,7 @@ export function cleanCommandOutput(
 ): string {
   const withoutPrompts = cleanShellOutput(output, false);
   const joined = stripEchoedCommandPrefix(withoutPrompts, command);
-  return stripOutput ? stripAnsi(joined) : normalizeNewlines(joined).trim();
+  return stripOutput ? stripAnsi(joined) : stripAnsiPreserveWhitespace(joined).trim();
 }
 
 export function cleanInitialBanner(output: string): string {

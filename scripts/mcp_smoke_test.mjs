@@ -202,6 +202,7 @@ async function main() {
     tools: [],
     policy: null,
     commandReviews: [],
+    interactions: [],
     sqlReviews: [],
     dbSession: null,
     session: null,
@@ -281,6 +282,56 @@ async function main() {
     summary.sqlReviews.push({
       label,
       sql,
+      result,
+    });
+
+    return result;
+  };
+
+  const runInteractive = async (label, command, options = {}) => {
+    const request = {
+      sessionId,
+      command,
+      ...options,
+    };
+
+    delete request.autoConfirm;
+    const shouldAutoConfirm = options.autoConfirm ?? true;
+
+    let result = await client.callTool("start_interactive_command", request);
+
+    if (
+      shouldAutoConfirm &&
+      result.error === "CONFIRMATION_REQUIRED" &&
+      result.approvalId &&
+      result.requiredConfirmationToken
+    ) {
+      result = await client.callTool("start_interactive_command", {
+        ...request,
+        approvalId: result.approvalId,
+        userConfirmation: result.requiredConfirmationToken,
+      });
+    }
+
+    summary.interactions.push({
+      label,
+      command,
+      result,
+    });
+
+    return result;
+  };
+
+  const sendInteractionInput = async (label, input, options = {}) => {
+    const result = await client.callTool("send_interaction_input", {
+      sessionId,
+      input,
+      ...options,
+    });
+
+    summary.interactions.push({
+      label,
+      input,
       result,
     });
 
@@ -459,6 +510,73 @@ async function main() {
         };
       }
     }
+
+    const readPromptInteraction = await runInteractive(
+      "read-prompt",
+      "printf 'Name: '; read name; printf 'Hello %s\\n' \"$name\"",
+      {
+        timeout: 30000,
+        waitForOutputMs: 1500,
+      },
+    );
+    const readPromptState = await client.callTool("read_interaction_state", {
+      sessionId,
+      clear: false,
+    });
+    const readPromptResponse = await sendInteractionInput("read-prompt-response", "Codex\\n", {
+      waitForOutputMs: 1500,
+    });
+
+    summary.interactions.push({
+      label: "read-prompt-summary",
+      result: {
+        start: readPromptInteraction,
+        state: readPromptState,
+        afterInput: readPromptResponse,
+      },
+    });
+
+    const sudoInteractive = await runInteractive(
+      "sudo-password",
+      "sudo -k ls /home/nmsadmin | head -n 5",
+      {
+        timeout: 30000,
+        waitForOutputMs: 2000,
+        sudoPassword: password,
+      },
+    );
+    const sudoState = await client.callTool("read_interaction_state", {
+      sessionId,
+      clear: false,
+    });
+    const sudoResponse =
+      sudoState.safeToAutoRespond && sudoState.promptType === "sudo_password"
+        ? await sendInteractionInput("sudo-password-response", `${password}\\n`, {
+            waitForOutputMs: 1500,
+            redactInput: true,
+          })
+        : null;
+    let sudoFinalState = await client.callTool("read_interaction_state", {
+      sessionId,
+      clear: false,
+    });
+    for (let attempt = 0; attempt < 10 && sudoFinalState.running; attempt += 1) {
+      await delay(250);
+      sudoFinalState = await client.callTool("read_interaction_state", {
+        sessionId,
+        clear: false,
+      });
+    }
+
+    summary.interactions.push({
+      label: "sudo-password-summary",
+      result: {
+        start: sudoInteractive,
+        state: sudoState,
+        response: sudoResponse,
+        finalState: sudoFinalState,
+      },
+    });
 
     await runCommand(
       "product-bin-check",

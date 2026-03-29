@@ -22,7 +22,12 @@ import {
   type OracleDbSession,
   type PendingSqlApproval,
 } from "./db-session.js";
-import { executeCommand, interruptSession } from "./executor.js";
+import {
+  executeCommand,
+  interruptSession,
+  startInteractiveCommand,
+  waitForCommandActivity,
+} from "./executor.js";
 import {
   loadCommandPolicyConfig,
   loadSqlPolicyConfig,
@@ -37,7 +42,9 @@ import {
 import { closeShellSession, connectShellSession, type AuthMethod } from "./ssh.js";
 import { reviewSqlPolicy } from "./sql-policy.js";
 import {
+  analyzeInteractionPrompt,
   cleanShellOutput,
+  cleanCommandOutput,
   decodeInputEscapes,
   DEFAULT_TERMINAL_COLS,
   DEFAULT_TERMINAL_ROWS,
@@ -115,6 +122,26 @@ const TOOL_DEFINITIONS = [
     },
   },
   {
+    name: "start_interactive_command",
+    description:
+      "Starts a command inside the PTY session and keeps the interaction open so the agent can inspect prompts and send follow-up input safely.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["sessionId", "command"],
+      properties: {
+        sessionId: { type: "string" },
+        command: { type: "string" },
+        timeout: { type: "integer", default: DEFAULT_COMMAND_TIMEOUT_MS },
+        waitForOutputMs: { type: "integer", default: 1500 },
+        sudoPassword: { type: "string" },
+        stripAnsi: { type: "boolean", default: true },
+        approvalId: { type: "string" },
+        userConfirmation: { type: "string" },
+      },
+    },
+  },
+  {
     name: "review_command",
     description:
       "Reviews a command before execution and returns whether MCP can auto-run it, must ask the user first, or is blocked by explicit policy.",
@@ -139,12 +166,30 @@ const TOOL_DEFINITIONS = [
       properties: {
         sessionId: { type: "string" },
         input: { type: "string" },
+        redactInput: { type: "boolean", default: false },
+      },
+    },
+  },
+  {
+    name: "send_interaction_input",
+    description:
+      "Sends follow-up input to an active interactive PTY command, optionally waits for fresh output, and returns a classified interaction snapshot.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["sessionId", "input"],
+      properties: {
+        sessionId: { type: "string" },
+        input: { type: "string" },
+        waitForOutputMs: { type: "integer", default: 1500 },
+        stripAnsi: { type: "boolean", default: true },
+        redactInput: { type: "boolean", default: false },
       },
     },
   },
   {
     name: "read_output",
-    description: "Reads the current PTY output buffer.",
+    description: "Reads the current PTY output buffer and returns the current interaction classification.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -152,6 +197,22 @@ const TOOL_DEFINITIONS = [
       properties: {
         sessionId: { type: "string" },
         clear: { type: "boolean", default: false },
+        stripAnsi: { type: "boolean", default: true },
+      },
+    },
+  },
+  {
+    name: "read_interaction_state",
+    description:
+      "Returns the active PTY interaction state, including prompt classification, command mode, and the latest output from the running command or shell.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["sessionId"],
+      properties: {
+        sessionId: { type: "string" },
+        clear: { type: "boolean", default: false },
+        stripAnsi: { type: "boolean", default: true },
       },
     },
   },
@@ -636,9 +697,10 @@ function ensureCommandApproval(
     review.summary,
   );
 
+  const normalizedConfirmation = userConfirmation ? normalizeApprovalText(userConfirmation) : undefined;
   const confirmationAccepted =
     approvalId === pendingApproval.approvalId &&
-    userConfirmation === pendingApproval.requiredConfirmationToken &&
+    normalizedConfirmation === pendingApproval.requiredConfirmationToken &&
     pendingApproval.expiresAt > Date.now();
 
   if (confirmationAccepted) {
@@ -682,11 +744,94 @@ function ensureCommandApproval(
     commandReview: review,
     confirmationPrompt: `Command: ${command}\nConsequence: ${review.summary}\nReply with exact CONFIRM before MCP runs it.`,
     instructions:
-      `Show the exact command and the consequence summary to the user. Only retry execute_command after the user replies with CONFIRM, using approvalId "${pendingApproval.approvalId}" and userConfirmation "CONFIRM".`,
+      `Show the exact command and the consequence summary to the user. Only retry execute_command or start_interactive_command after the user replies with CONFIRM, using approvalId "${pendingApproval.approvalId}" and userConfirmation "CONFIRM".`,
   });
 }
 
+function guessForegroundCommand(command: string | undefined): string | null {
+  if (!command) {
+    return null;
+  }
+
+  let normalized = normalizeApprovalText(command);
+  normalized = normalized.replace(
+    /^(?:[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|[^\s]+)\s+)*/,
+    "",
+  );
+  normalized = normalized.replace(/^sudo(?:\s+-[^\s]+(?:\s+[^\s]+)?)?\s+/i, "");
+
+  const match = normalized.match(/^\s*([A-Za-z_][A-Za-z0-9._-]*)\b/);
+  return match?.[1] ?? null;
+}
+
+function buildInteractionState(
+  session: ShellSession,
+  stripAnsi = true,
+): Record<string, unknown> {
+  const activeCommand = session.activeCommand;
+  const sourceBuffer = activeCommand ? activeCommand.buffer : session.buffer;
+  const output = activeCommand
+    ? cleanCommandOutput(sourceBuffer, activeCommand.submittedCommand, stripAnsi)
+    : cleanShellOutput(sourceBuffer, stripAnsi);
+  const prompt = analyzeInteractionPrompt(sourceBuffer, {
+    commandHint: activeCommand?.command,
+    sessionReady: session.ready,
+  });
+  const suggestedInputs = [...prompt.suggestions];
+
+  let safeToAutoRespond = prompt.safeToAutoRespond;
+  const autoResponseSent =
+    prompt.promptType === "sudo_password" &&
+    Boolean(activeCommand?.sudoPassword) &&
+    (activeCommand?.sudoPromptAttempts ?? 0) > 0;
+
+  if (prompt.promptType === "sudo_password" && activeCommand?.sudoPassword) {
+    if (autoResponseSent) {
+      safeToAutoRespond = false;
+      suggestedInputs.unshift({
+        input: "",
+        description: "The server already submitted the provided sudo password. Wait for more output before sending anything else.",
+      });
+    } else {
+      safeToAutoRespond = true;
+      suggestedInputs.unshift({
+        input: "<provided sudo password>\\n",
+        description: "Submit the sudo password supplied with the active command.",
+        sensitive: true,
+      });
+    }
+  }
+
+  return {
+    sessionMode: activeCommand
+      ? activeCommand.executionMode
+      : session.manualMode
+        ? "manual"
+        : "idle",
+    activeCommand: activeCommand?.command ?? null,
+    foregroundCommand: guessForegroundCommand(activeCommand?.command),
+    running: Boolean(activeCommand && !activeCommand.completed),
+    completed: Boolean(activeCommand?.completed),
+    exitCode: activeCommand?.completed ? (activeCommand.exitCode ?? 0) : null,
+    startedAt: activeCommand?.startedAt ?? null,
+    executionMs: activeCommand ? Date.now() - activeCommand.startedAt : null,
+    promptType: prompt.promptType,
+    promptText: prompt.promptText,
+    confidence: prompt.confidence,
+    expectsInput: prompt.expectsInput,
+    safeToAutoRespond,
+    autoResponseSent,
+    suggestedInputs,
+    output,
+    bufferLength: sourceBuffer.length,
+    sessionReady: session.ready,
+    isSudo: session.isSudo,
+  };
+}
+
 function toSessionSummary(session: ShellSession): Record<string, unknown> {
+  const interaction = buildInteractionState(session, true);
+
   return {
     sessionId: session.id,
     host: session.host,
@@ -697,6 +842,13 @@ function toSessionSummary(session: ShellSession): Record<string, unknown> {
     isSudo: session.isSudo,
     ready: session.ready,
     pendingApproval: toPendingApprovalSummary(session.pendingApproval),
+    interaction: {
+      sessionMode: interaction["sessionMode"],
+      foregroundCommand: interaction["foregroundCommand"],
+      running: interaction["running"],
+      promptType: interaction["promptType"],
+      expectsInput: interaction["expectsInput"],
+    },
   };
 }
 
@@ -839,9 +991,10 @@ function ensureSqlApproval(
     review.summary,
   );
 
+  const normalizedConfirmation = userConfirmation ? normalizeApprovalText(userConfirmation) : undefined;
   const confirmationAccepted =
     approvalId === pendingApproval.approvalId &&
-    userConfirmation === pendingApproval.requiredConfirmationToken &&
+    normalizedConfirmation === pendingApproval.requiredConfirmationToken &&
     pendingApproval.expiresAt > Date.now();
 
   if (confirmationAccepted) {
@@ -968,6 +1121,7 @@ async function callExecuteCommand(
       category: policy.category,
       timeoutMs,
       confirmationUsed: Boolean(userConfirmation),
+      executionMode: "oneshot",
     },
   });
 
@@ -991,11 +1145,13 @@ async function callExecuteCommand(
         category: policy.category,
         exitCode: result.exitCode,
         executionMs: result.executionMs,
+        executionMode: "oneshot",
       },
     });
 
     return {
       ...result,
+      interaction: buildInteractionState(session, stripAnsi),
       policy: {
         riskLevel: policy.riskLevel,
         category: policy.category,
@@ -1003,6 +1159,10 @@ async function callExecuteCommand(
     };
   } catch (error) {
     if (error instanceof HandledError) {
+      if (error.code === "TIMEOUT") {
+        error.details["interaction"] = buildInteractionState(session, stripAnsi);
+      }
+
       sessionManager.recordAudit({
         level: error.code === "TIMEOUT" ? "warning" : "error",
         event: error.code === "TIMEOUT" ? "command_timed_out" : "command_failed",
@@ -1014,6 +1174,7 @@ async function callExecuteCommand(
         riskLevel: policy.riskLevel,
         details: {
           category: policy.category,
+          executionMode: "oneshot",
           ...error.details,
         },
       });
@@ -1023,13 +1184,105 @@ async function callExecuteCommand(
   }
 }
 
-async function callWriteStdin(
+async function callStartInteractiveCommand(
   args: Record<string, unknown>,
 ): Promise<Record<string, unknown>> {
   const sessionId = readString(args, "sessionId", true) ?? "";
-  const input = readString(args, "input", true) ?? "";
+  const command = readString(args, "command", true) ?? "";
+  const timeoutMs = readPositiveInteger(args, "timeout", DEFAULT_COMMAND_TIMEOUT_MS);
+  const waitForOutputMs = readPositiveInteger(args, "waitForOutputMs", 1500);
+  const sudoPassword = readString(args, "sudoPassword");
+  const stripAnsi = readBoolean(args, "stripAnsi", true);
+  const approvalId = readString(args, "approvalId");
+  const userConfirmation = readString(args, "userConfirmation");
   const session = sessionManager.require(sessionId);
-  const decodedInput = decodeInputEscapes(input);
+  const policy = ensureCommandApproval(session, command, approvalId, userConfirmation);
+
+  sessionManager.recordAudit({
+    level: "info",
+    event: "command_started",
+    message: `Started ${policy.riskLevel} interactive command execution.`,
+    sessionId: session.id,
+    host: session.host,
+    username: session.username,
+    command,
+    riskLevel: policy.riskLevel,
+    details: {
+      category: policy.category,
+      timeoutMs,
+      waitForOutputMs,
+      confirmationUsed: Boolean(userConfirmation),
+      executionMode: "interactive",
+    },
+  });
+
+  try {
+    const result = await startInteractiveCommand(session, command, {
+      timeoutMs,
+      waitForOutputMs,
+      sudoPassword,
+      stripAnsiOutput: stripAnsi,
+    });
+
+    if (result.completed) {
+      sessionManager.recordAudit({
+        level: "info",
+        event: "command_completed",
+        message: `Completed interactive command with exit code ${result.exitCode ?? 0}.`,
+        sessionId: session.id,
+        host: session.host,
+        username: session.username,
+        command,
+        riskLevel: policy.riskLevel,
+        details: {
+          category: policy.category,
+          exitCode: result.exitCode ?? 0,
+          executionMs: result.executionMs,
+          executionMode: "interactive",
+        },
+      });
+    }
+
+    return {
+      ...result,
+      interaction: buildInteractionState(session, stripAnsi),
+      policy: {
+        riskLevel: policy.riskLevel,
+        category: policy.category,
+      },
+    };
+  } catch (error) {
+    if (error instanceof HandledError) {
+      error.details["interaction"] = buildInteractionState(session, stripAnsi);
+
+      sessionManager.recordAudit({
+        level: "error",
+        event: "command_failed",
+        message: error.message,
+        sessionId: session.id,
+        host: session.host,
+        username: session.username,
+        command,
+        riskLevel: policy.riskLevel,
+        details: {
+          category: policy.category,
+          executionMode: "interactive",
+          ...error.details,
+        },
+      });
+    }
+
+    throw error;
+  }
+}
+
+function writeInputToSession(
+  session: ShellSession,
+  decodedInput: string,
+  options: {
+    redactInput?: boolean;
+  } = {},
+): { controlOnly: boolean } {
   const controlOnly = /^[\x03\x04\r\n]+$/.test(decodedInput);
 
   if (session.ready && !session.manualMode && !session.activeCommand && !controlOnly) {
@@ -1041,19 +1294,17 @@ async function callWriteStdin(
       host: session.host,
       username: session.username,
       details: {
-        inputPreview: sanitizePreview(decodedInput),
+        inputPreview: options.redactInput ? "<redacted>" : sanitizePreview(decodedInput),
       },
     });
 
     throw new HandledError(
       "WRITE_STDIN_RESTRICTED",
-      "Raw stdin is only allowed while an interactive program is already running or when sending recovery control keys. Use execute_command so the safety policy and approval flow are enforced.",
+      "Raw stdin is only allowed while an interactive program is already running or when sending recovery control keys. Use execute_command or start_interactive_command so the safety policy and approval flow are enforced.",
     );
   }
 
   if (decodedInput.includes("\x03") && session.activeCommand && !session.activeCommand.completed) {
-    // Treat manual Ctrl+C as an explicit interrupt so the session can recover
-    // even if the original command never reaches its sentinel line.
     session.activeCommand.timedOutReported = true;
   }
 
@@ -1078,11 +1329,59 @@ async function callWriteStdin(
     username: session.username,
     details: {
       controlOnly,
-      inputPreview: sanitizePreview(decodedInput),
+      inputPreview: options.redactInput ? "<redacted>" : sanitizePreview(decodedInput),
     },
   });
 
+  return { controlOnly };
+}
+
+async function callWriteStdin(
+  args: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  const sessionId = readString(args, "sessionId", true) ?? "";
+  const input = readString(args, "input", true) ?? "";
+  const redactInput = readBoolean(args, "redactInput", false);
+  const session = sessionManager.require(sessionId);
+  const decodedInput = decodeInputEscapes(input);
+  writeInputToSession(session, decodedInput, {
+    redactInput,
+  });
+
   return { written: true };
+}
+
+async function callSendInteractionInput(
+  args: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  const sessionId = readString(args, "sessionId", true) ?? "";
+  const input = readString(args, "input", true) ?? "";
+  const waitForOutputMs = readPositiveInteger(args, "waitForOutputMs", 1500);
+  const stripAnsi = readBoolean(args, "stripAnsi", true);
+  const redactInput = readBoolean(args, "redactInput", false);
+  const session = sessionManager.require(sessionId);
+
+  if ((session.activeCommand && session.activeCommand.completed) || (!session.activeCommand && !session.manualMode)) {
+    throw new HandledError(
+      "NO_ACTIVE_INTERACTION",
+      "There is no active interactive PTY command to receive follow-up input.",
+    );
+  }
+
+  const decodedInput = decodeInputEscapes(input);
+  const previousLength = session.activeCommand?.buffer.length ?? session.buffer.length;
+  writeInputToSession(session, decodedInput, {
+    redactInput,
+  });
+
+  if (waitForOutputMs > 0) {
+    await waitForCommandActivity(session, previousLength, waitForOutputMs);
+  }
+
+  return {
+    written: true,
+    interaction: buildInteractionState(session, stripAnsi),
+  };
 }
 
 async function callReviewCommand(
@@ -1181,6 +1480,7 @@ async function callInterruptSession(
     sessionReady: result.sessionReady,
     clearedActiveCommand: result.clearedActiveCommand,
     bufferLength: session.buffer.length,
+    interaction: buildInteractionState(session, true),
   };
 }
 
@@ -1189,20 +1489,40 @@ async function callReadOutput(
 ): Promise<Record<string, unknown>> {
   const sessionId = readString(args, "sessionId", true) ?? "";
   const clear = readBoolean(args, "clear", false);
+  const stripAnsi = readBoolean(args, "stripAnsi", true);
   const session = sessionManager.require(sessionId);
-  const output = cleanShellOutput(session.buffer, true);
+  const interaction = buildInteractionState(session, stripAnsi);
 
   if (clear) {
-    sessionManager.clearBuffer(session);
+    sessionManager.clearBuffer(session, true);
   } else {
     sessionManager.touch(session);
   }
 
   return {
-    output,
-    bufferLength: session.buffer.length,
+    output: interaction["output"],
+    bufferLength: interaction["bufferLength"],
     sessionReady: session.ready,
+    interaction,
   };
+}
+
+async function callReadInteractionState(
+  args: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  const sessionId = readString(args, "sessionId", true) ?? "";
+  const clear = readBoolean(args, "clear", false);
+  const stripAnsi = readBoolean(args, "stripAnsi", true);
+  const session = sessionManager.require(sessionId);
+  const interaction = buildInteractionState(session, stripAnsi);
+
+  if (clear) {
+    sessionManager.clearBuffer(session, true);
+  } else {
+    sessionManager.touch(session);
+  }
+
+  return interaction;
 }
 
 async function callResizeTerminal(
@@ -1652,12 +1972,18 @@ function buildServer() {
         return await safeToolCall(() => callSshConnect(args));
       case "execute_command":
         return await safeToolCall(() => callExecuteCommand(args));
+      case "start_interactive_command":
+        return await safeToolCall(() => callStartInteractiveCommand(args));
       case "review_command":
         return await safeToolCall(() => callReviewCommand(args));
       case "write_stdin":
         return await safeToolCall(() => callWriteStdin(args));
+      case "send_interaction_input":
+        return await safeToolCall(() => callSendInteractionInput(args));
       case "read_output":
         return await safeToolCall(() => callReadOutput(args));
+      case "read_interaction_state":
+        return await safeToolCall(() => callReadInteractionState(args));
       case "resize_terminal":
         return await safeToolCall(() => callResizeTerminal(args));
       case "list_sessions":

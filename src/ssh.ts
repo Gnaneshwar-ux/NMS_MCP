@@ -312,7 +312,10 @@ function attachSessionListeners(session: ShellSession, sessionManager: SessionMa
 async function initializeShell(session: ShellSession, timeoutMs: number): Promise<string> {
   const readyMarker = `${SHELL_READY_MARKER_PREFIX}${Date.now()}_${Math.floor(Math.random() * 1000)}`;
   const setupLine =
+    `stty -echo 2>/dev/null || true; ` +
+    `bind 'set enable-bracketed-paste off' 2>/dev/null || true; ` +
     `export PS1='${SHELL_PROMPT_MARKER} '; ` +
+    `export PS2=''; ` +
     `PROMPT_COMMAND=; echo "${readyMarker}"`;
   const startedAt = Date.now();
 

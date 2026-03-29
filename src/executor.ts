@@ -24,10 +24,118 @@ export interface ExecuteCommandResult {
   executionMs: number;
 }
 
+export interface StartInteractiveCommandOptions {
+  timeoutMs: number;
+  sudoPassword?: string;
+  stripAnsiOutput: boolean;
+  waitForOutputMs: number;
+}
+
+export interface StartInteractiveCommandResult {
+  stdout: string;
+  started: true;
+  completed: boolean;
+  exitCode: number | null;
+  executionMs: number;
+}
+
 export interface InterruptSessionOptions {
   signal: "ctrlC" | "ctrlD" | "newline";
   waitForReadyMs: number;
   clearBuffer: boolean;
+}
+
+function buildWrappedCommand(command: string, sentinelId: string): string {
+  const escapedCommand = command
+    .replace(/\\/g, "\\\\")
+    .replace(/'/g, `'\\''`)
+    .replace(/\r/g, "\\r")
+    .replace(/\n/g, "\\n");
+
+  return (
+    `__mcp_cmd='${escapedCommand}'; ` +
+    `eval "$(printf '%b' "$__mcp_cmd")"; ` +
+    `__mcp_exit_code=$?; ` +
+    `export PS1='${SHELL_PROMPT_MARKER} '; ` +
+    `PROMPT_COMMAND=; ` +
+    `echo "${sentinelId}_$__mcp_exit_code"\n`
+  );
+}
+
+function ensureSessionCanStartCommand(session: ShellSession): void {
+  handleShellData(session);
+
+  if (session.activeCommand?.completed) {
+    session.activeCommand = undefined;
+  }
+
+  if (session.activeCommand || !session.ready) {
+    throw new HandledError(
+      "SHELL_BUSY",
+      "The PTY shell is still busy with a previous command or interactive program.",
+    );
+  }
+
+  if (session.closed) {
+    throw new HandledError(
+      "SESSION_NOT_FOUND",
+      `Session "${session.id}" is no longer available.`,
+    );
+  }
+}
+
+function beginCommand(
+  session: ShellSession,
+  command: string,
+  options: {
+    timeoutMs: number;
+    sudoPassword?: string;
+    stripAnsiOutput: boolean;
+    executionMode: "oneshot" | "interactive";
+  },
+): { sentinelId: string; startedAt: number } {
+  const sentinelId = generateSentinel();
+  const startedAt = Date.now();
+  const submittedCommand = buildWrappedCommand(command, sentinelId);
+
+  session.activeCommand = {
+    command,
+    submittedCommand,
+    executionMode: options.executionMode,
+    sentinelId,
+    startedAt,
+    timeoutMs: options.timeoutMs,
+    buffer: "",
+    sudoPassword: options.sudoPassword,
+    sudoPromptAttempts: 0,
+    lastSudoPromptBufferLength: 0,
+    completed: false,
+    timedOutReported: false,
+    stripAnsiOutput: options.stripAnsiOutput,
+  };
+  session.ready = false;
+  session.manualMode = options.executionMode === "interactive";
+  session.lastUsedAt = startedAt;
+
+  session.shell.write(submittedCommand);
+
+  return {
+    sentinelId,
+    startedAt,
+  };
+}
+
+function cleanActiveCommandOutput(session: ShellSession): string {
+  const activeCommand = session.activeCommand;
+  if (!activeCommand) {
+    return "";
+  }
+
+  return cleanCommandOutput(
+    activeCommand.buffer,
+    activeCommand.submittedCommand,
+    activeCommand.stripAnsiOutput,
+  );
 }
 
 function maybeFinalizeActiveCommand(session: ShellSession): void {
@@ -56,7 +164,7 @@ function maybeFinalizeActiveCommand(session: ShellSession): void {
   activeCommand.exitCode = Number.isFinite(exitCode) ? exitCode : 0;
   activeCommand.output = cleanCommandOutput(
     activeCommand.buffer,
-    activeCommand.command,
+    activeCommand.submittedCommand,
     activeCommand.stripAnsiOutput,
   );
 
@@ -123,6 +231,51 @@ export async function waitForSessionReady(
   return session.ready;
 }
 
+export async function waitForCommandActivity(
+  session: ShellSession,
+  previousOutputLength: number,
+  timeoutMs: number,
+): Promise<{ observedOutput: boolean; commandCompleted: boolean; sessionReady: boolean }> {
+  const startedAt = Date.now();
+
+  while (Date.now() - startedAt < timeoutMs) {
+    if (session.closed) {
+      return {
+        observedOutput: false,
+        commandCompleted: false,
+        sessionReady: false,
+      };
+    }
+
+    handleShellData(session);
+    const activeCommand = session.activeCommand;
+    if (!activeCommand) {
+      return {
+        observedOutput: session.buffer.length > previousOutputLength,
+        commandCompleted: true,
+        sessionReady: session.ready,
+      };
+    }
+
+    if (activeCommand.completed || activeCommand.buffer.length > previousOutputLength) {
+      return {
+        observedOutput: activeCommand.buffer.length > previousOutputLength,
+        commandCompleted: activeCommand.completed,
+        sessionReady: session.ready,
+      };
+    }
+
+    await sleep(50);
+  }
+
+  const activeCommand = session.activeCommand;
+  return {
+    observedOutput: Boolean(activeCommand && activeCommand.buffer.length > previousOutputLength),
+    commandCompleted: Boolean(activeCommand?.completed),
+    sessionReady: session.ready,
+  };
+}
+
 export async function interruptSession(
   session: ShellSession,
   options: InterruptSessionOptions,
@@ -157,51 +310,13 @@ export async function executeCommand(
   command: string,
   options: ExecuteCommandOptions,
 ): Promise<ExecuteCommandResult> {
-  handleShellData(session);
-
-  if (session.activeCommand?.completed) {
-    session.activeCommand = undefined;
-  }
-
-  if (session.activeCommand || !session.ready) {
-    throw new HandledError(
-      "SHELL_BUSY",
-      "The PTY shell is still busy with a previous command or interactive program.",
-    );
-  }
-
-  if (session.closed) {
-    throw new HandledError(
-      "SESSION_NOT_FOUND",
-      `Session "${session.id}" is no longer available.`,
-    );
-  }
-
-  const sentinelId = generateSentinel();
-  const startedAt = Date.now();
-  const completionLine =
-    `__mcp_exit_code=$?; export PS1='${SHELL_PROMPT_MARKER} '; ` +
-    `PROMPT_COMMAND=; echo "${sentinelId}_\${__mcp_exit_code}"`;
-
-  session.activeCommand = {
-    command,
-    sentinelId,
-    startedAt,
+  ensureSessionCanStartCommand(session);
+  const { startedAt } = beginCommand(session, command, {
     timeoutMs: options.timeoutMs,
-    buffer: "",
     sudoPassword: options.sudoPassword,
-    sudoPromptAttempts: 0,
-    completed: false,
-    timedOutReported: false,
     stripAnsiOutput: options.stripAnsiOutput,
-  };
-  session.ready = false;
-  session.manualMode = false;
-  session.lastUsedAt = startedAt;
-
-  // The sentinel line is queued after the user's command in the same PTY so we
-  // can wait for real shell completion instead of guessing with fixed sleeps.
-  session.shell.write(`${command}\n${completionLine}\n`);
+    executionMode: "oneshot",
+  });
 
   while (true) {
     const activeCommand = session.activeCommand;
@@ -239,13 +354,9 @@ export async function executeCommand(
 
       throw new HandledError(
         "TIMEOUT",
-        `Command timed out after ${options.timeoutMs}ms. The shell is still attached; use read_output or write_stdin to continue managing it.`,
+        `Command timed out after ${options.timeoutMs}ms. The shell is still attached; use read_output or read_interaction_state to inspect it, then send_interaction_input or write_stdin to continue managing it.`,
         {
-          partialOutput: cleanCommandOutput(
-            activeCommand.buffer,
-            activeCommand.command,
-            activeCommand.stripAnsiOutput,
-          ),
+          partialOutput: cleanActiveCommandOutput(session),
           executionMs,
           timedOut: true,
         },
@@ -254,4 +365,46 @@ export async function executeCommand(
 
     await sleep(50);
   }
+}
+
+export async function startInteractiveCommand(
+  session: ShellSession,
+  command: string,
+  options: StartInteractiveCommandOptions,
+): Promise<StartInteractiveCommandResult> {
+  ensureSessionCanStartCommand(session);
+  const { startedAt } = beginCommand(session, command, {
+    timeoutMs: options.timeoutMs,
+    sudoPassword: options.sudoPassword,
+    stripAnsiOutput: options.stripAnsiOutput,
+    executionMode: "interactive",
+  });
+
+  const baselineOutputLength = session.activeCommand?.buffer.length ?? 0;
+  if (options.waitForOutputMs > 0) {
+    await waitForCommandActivity(session, baselineOutputLength, options.waitForOutputMs);
+  }
+
+  const activeCommand = session.activeCommand;
+  const completed = Boolean(activeCommand?.completed);
+  const executionMs = Date.now() - startedAt;
+
+  if (completed && activeCommand) {
+    const stdout = activeCommand.output ?? cleanActiveCommandOutput(session);
+    return {
+      stdout,
+      started: true,
+      completed: true,
+      exitCode: activeCommand.exitCode ?? 0,
+      executionMs,
+    };
+  }
+
+  return {
+    stdout: cleanActiveCommandOutput(session),
+    started: true,
+    completed: false,
+    exitCode: null,
+    executionMs,
+  };
 }

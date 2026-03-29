@@ -53,12 +53,15 @@ export interface AuditEntry {
 
 export interface ActiveCommandState {
   command: string;
+  submittedCommand: string;
+  executionMode: "oneshot" | "interactive";
   sentinelId: string;
   startedAt: number;
   timeoutMs: number;
   buffer: string;
   sudoPassword?: string;
   sudoPromptAttempts: number;
+  lastSudoPromptBufferLength: number;
   completed: boolean;
   completedAt?: number;
   exitCode?: number;
@@ -158,8 +161,12 @@ export class SessionManager {
     session.lastUsedAt = Date.now();
   }
 
-  clearBuffer(session: ShellSession): void {
+  clearBuffer(session: ShellSession, includeActiveCommand = true): void {
     session.buffer = "";
+    if (includeActiveCommand && session.activeCommand) {
+      session.activeCommand.buffer = "";
+      session.activeCommand.lastSudoPromptBufferLength = 0;
+    }
     session.lastUsedAt = Date.now();
   }
 

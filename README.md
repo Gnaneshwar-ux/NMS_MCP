@@ -6,6 +6,7 @@ Production-grade MCP server for persistent SSH PTY sessions and cached Oracle DB
 
 - Uses `ssh2` directly so the server can keep a real PTY shell alive across MCP calls
 - Keeps Oracle DB connections open across MCP calls so agents can reuse DB session state
+- Supports guided interactive PTY commands with prompt classification and follow-up input tools
 - Auto-runs only an explicit safe read-only command list and safe SELECT queries
 - Requires user confirmation for anything outside the explicit safe list
 - Supports custom project and NMS commands, but never runs them blindly when MCP is not confident about the consequences
@@ -70,8 +71,11 @@ Shell tools:
 - `ssh_connect`
 - `review_command`
 - `execute_command`
+- `start_interactive_command`
 - `write_stdin`
+- `send_interaction_input`
 - `read_output`
+- `read_interaction_state`
 - `resize_terminal`
 - `list_sessions`
 - `close_session`
@@ -95,6 +99,28 @@ Shared visibility:
 
 The server does not trust user intent or agent intent. It reviews the exact command or SQL text first, decides whether it is on the explicit safe list, and otherwise requires confirmation before running it.
 
+## Interactive PTY model
+
+For simple commands, use `execute_command`.
+
+For anything that may prompt, stream, or open a REPL, use the guided interactive flow:
+
+1. `start_interactive_command`
+2. `read_interaction_state`
+3. `send_interaction_input`
+4. `interrupt_session` or wait for the command to complete
+
+The server keeps the PTY stateful, classifies common prompt types, and returns structured interaction metadata such as:
+
+- `promptType`
+- `promptText`
+- `expectsInput`
+- `safeToAutoRespond`
+- `suggestedInputs`
+- `foregroundCommand`
+
+Prompt types currently include shell prompts, sudo/password prompts, yes/no prompts, press-enter prompts, Python REPL prompts, SQL prompts, pagers, and fallback unknown interactive prompts.
+
 ### Safe shell auto-run list
 
 These commands can auto-run when MCP can clearly recognize them and does not detect extra unsafe behavior:
@@ -114,6 +140,7 @@ These commands can auto-run when MCP can clearly recognize them and does not det
 Notes:
 
 - `cd` is treated as low-impact and allowed because it only changes the active shell directory
+- Commands that start interactive terminal programs such as `python`, `sqlplus`, `ISQL`, `tail -f`, `less`, `top`, or `ssh` are not treated as safe auto-run commands
 - If MCP sees shell redirection to files, inline scripts, `sudo`, or other risky patterns, it will stop auto-running and ask first
 - If MCP is not confident that a custom project command is harmless, it asks first
 
@@ -339,8 +366,9 @@ SSH:
 
 1. Call `ssh_connect`.
 2. Call `review_command` for anything outside the obvious safe list or when you want MCP to explain the risk before asking the user.
-3. Run `execute_command`.
+3. Use `execute_command` for one-shot commands, or `start_interactive_command` for prompt-driven commands.
 4. If MCP returns `CONFIRMATION_REQUIRED`, show the exact command and the summary, then retry with the same `approvalId` and `userConfirmation: "CONFIRM"`.
+5. For interactive runs, inspect `read_interaction_state` and continue with `send_interaction_input`.
 
 Oracle DB:
 
@@ -369,6 +397,26 @@ Custom project command that requires confirmation:
 }
 ```
 
+Interactive prompt-driven command:
+
+```json
+{
+  "sessionId": "abc123",
+  "command": "python3 -q",
+  "waitForOutputMs": 1500
+}
+```
+
+Follow-up interactive input:
+
+```json
+{
+  "sessionId": "abc123",
+  "input": "print(2 + 2)\\n",
+  "waitForOutputMs": 1000
+}
+```
+
 Safe SQL query:
 
 ```json
@@ -394,9 +442,10 @@ If a long-running command times out or an interactive program appears stuck, the
 Recommended recovery steps:
 
 1. Call `read_output` to inspect the latest PTY output.
-2. Call `interrupt_session` with `ctrlC` to bring the shell back to a prompt.
-3. Call `read_output` again if you want to capture the interrupt output.
-4. Run a safe command such as `pwd` to confirm the shell is ready again.
+2. Call `read_interaction_state` when you want prompt classification instead of raw output alone.
+3. Call `interrupt_session` with `ctrlC` to bring the shell back to a prompt.
+4. Call `read_output` again if you want to capture the interrupt output.
+5. Run a safe command such as `pwd` to confirm the shell is ready again.
 
 This is safer than blindly starting a new session because the existing working directory, sourced environment, and any confirmed elevation state remain visible and auditable.
 

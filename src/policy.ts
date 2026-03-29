@@ -125,6 +125,14 @@ const MUTATING_RULES: MatchRule[] = [
   },
   {
     riskLevel: "mutating",
+    category: "account-change",
+    summary: "This command can create, modify, lock, unlock, or remove operating-system users and groups.",
+    reason: "Matches local account-management commands such as useradd, usermod, passwd, or chpasswd.",
+    regex:
+      /(?:^|[;&|]\s*)(?:useradd\b|adduser\b|usermod\b|userdel\b|groupadd\b|groupmod\b|groupdel\b|passwd\b|chpasswd\b|gpasswd\b|chage\b)/i,
+  },
+  {
+    riskLevel: "mutating",
     category: "service-change",
     summary: "This command can change service or process availability.",
     reason: "Matches service control actions such as start, stop, restart, or kill.",
@@ -163,6 +171,11 @@ const MUTATING_RULES: MatchRule[] = [
     regex:
       /\bgit\s+(?:commit|merge|rebase|checkout\b(?!\s+--)|restore\b|switch\b|cherry-pick\b|revert\b|stash\b)/i,
   },
+];
+
+const INTERACTIVE_COMMAND_PATTERNS = [
+  /(?:^|[;&|]\s*)(?:python(?:3)?\b|sqlplus\b|ISQL\b|isql\b|psql\b|mysql\b|sqlite3\b|rlwrap\b\s+\w+|less\b|more\b|man\b|vi\b|vim\b|nano\b|top\b|htop\b|watch\b|sftp\b|ftp\b|telnet\b|ssh\b|read\b)/i,
+  /(?:^|[;&|]\s*)tail\b[^\n]*\s-f(?:\s|$)/i,
 ];
 
 function normalizeCommand(command: string): string {
@@ -229,6 +242,10 @@ function containsFileRedirection(command: string): boolean {
   }
 
   return false;
+}
+
+function looksInteractiveCommand(command: string): boolean {
+  return INTERACTIVE_COMMAND_PATTERNS.some((pattern) => pattern.test(command));
 }
 
 function matchRules(command: string, rules: MatchRule[]): MatchRule[] {
@@ -403,6 +420,7 @@ export function reviewCommandPolicy(
   const mutatingMatches = matchRules(analysisTarget, MUTATING_RULES);
   const opaqueInlineScript = containsOpaqueInlineScript(analysisTarget);
   const fileRedirection = containsFileRedirection(analysisTarget);
+  const interactiveCommand = looksInteractiveCommand(analysisTarget);
 
   for (const match of destructiveMatches) {
     reasons.add(match.reason);
@@ -424,6 +442,10 @@ export function reviewCommandPolicy(
     reasons.add("Contains an inline script or heredoc, so the exact behavior is harder to verify quickly.");
   }
 
+  if (interactiveCommand) {
+    reasons.add("Starts an interactive or long-running terminal program that may require follow-up input.");
+  }
+
   let riskLevel: CommandRiskLevel = "read-only";
   let category = "general-shell";
   let summary = "";
@@ -437,7 +459,8 @@ export function reviewCommandPolicy(
     leadingCommand === "cd" &&
     mutatingMatches.every((match) => match.category === "session-state") &&
     !fileRedirection &&
-    !opaqueInlineScript
+    !opaqueInlineScript &&
+    !interactiveCommand
   ) {
     riskLevel = "mutating";
     category = "session-state";
@@ -451,6 +474,10 @@ export function reviewCommandPolicy(
       (fileRedirection
         ? "This command can write or overwrite files through shell redirection."
         : "This command includes an inline script or heredoc, so its behavior is harder to verify safely.");
+  } else if (interactiveCommand) {
+    riskLevel = "read-only";
+    category = "interactive-terminal";
+    summary = "This command starts an interactive or long-running terminal program.";
   } else {
     const readOnlySummary = buildReadOnlySummary(analysisTarget);
     category = readOnlySummary.category;

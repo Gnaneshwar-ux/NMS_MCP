@@ -95,6 +95,7 @@ Oracle DB tools:
 
 Shared visibility:
 
+- `read_usage_guide`
 - `read_policy`
 - `read_audit_log`
 

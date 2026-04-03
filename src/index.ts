@@ -51,6 +51,7 @@ import { maybeAdoptInteractiveShell } from "./shell-state.js";
 import { closeShellSession, connectShellSession, type AuthMethod } from "./ssh.js";
 import { reviewSqlPolicy } from "./sql-policy.js";
 import { inferShellIdentityTransition } from "./sudo.js";
+import { getUsageGuide } from "./usage-guide.js";
 import {
   analyzeInteractionPrompt,
   cleanShellOutput,
@@ -374,6 +375,16 @@ const TOOL_DEFINITIONS = [
   {
     name: "list_db_sessions",
     description: "Lists all active cached Oracle DB sessions.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {},
+    },
+  },
+  {
+    name: "read_usage_guide",
+    description:
+      "Returns MCP-specific usage guidance, preferred tool-selection style, anti-patterns, and operator-style recommendations for this server.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -2405,6 +2416,12 @@ async function callReadPolicy(): Promise<Record<string, unknown>> {
   };
 }
 
+async function callReadUsageGuide(): Promise<Record<string, unknown>> {
+  return {
+    usageGuide: getUsageGuide(),
+  };
+}
+
 async function callReadAuditLog(
   args: Record<string, unknown>,
 ): Promise<Record<string, unknown>> {
@@ -2584,6 +2601,8 @@ function buildServer() {
         return await safeToolCall(() => callReviewSql(args));
       case "list_db_sessions":
         return await safeToolCall(() => callListDbSessions());
+      case "read_usage_guide":
+        return await safeToolCall(() => callReadUsageGuide());
       case "read_policy":
         return await safeToolCall(() => callReadPolicy());
       case "read_audit_log":

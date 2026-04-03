@@ -80,6 +80,20 @@ test("allows known-safe read-only commands inside an already elevated session", 
   assert.equal(review.safeForAutoRun, true);
 });
 
+test("allows exact getent passwd lookups without treating them as password changes", () => {
+  const review = reviewCommandPolicy(
+    "getent passwd oracle",
+    undefined,
+    TEST_POLICY,
+  );
+
+  assert.equal(review.decision, "allow");
+  assert.equal(review.requiresConfirmation, false);
+  assert.equal(review.safeForAutoRun, true);
+  assert.equal(review.category, "account-read");
+  assert.equal(review.riskLevel, "read-only");
+});
+
 test("blocks piped sudo password changes even when the leading command looks harmless", () => {
   const review = reviewCommandPolicy(
     "echo 'test:Oracle1234' | sudo chpasswd",

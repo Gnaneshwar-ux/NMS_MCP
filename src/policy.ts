@@ -199,7 +199,7 @@ const MUTATING_RULES: MatchRule[] = [
     summary: "This command can change passwords or password-aging state.",
     reason: "Matches passwd, chpasswd, gpasswd, chage, or usermod password changes.",
     regex:
-      /\b(?:passwd|chpasswd|gpasswd|chage)\b|\busermod\b[\s\S]*\b(?:-p|--password)\b/i,
+      /^(?:\S+\/)?(?:passwd|chpasswd|gpasswd|chage)\b|\busermod\b[\s\S]*\b(?:-p|--password)\b/i,
   },
   {
     riskLevel: "mutating",

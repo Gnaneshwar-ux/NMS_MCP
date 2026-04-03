@@ -10,6 +10,7 @@ import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 
+import { summarizeCommandBatchReviews } from "./command-batch.js";
 import {
   closeBrokenOracleSession,
   closeOracleSession,
@@ -17,6 +18,11 @@ import {
   executeSql,
   interruptOracleExecution,
 } from "./db.js";
+import {
+  resolveOracleCredentials,
+  resolveSshCredentials,
+  resolveSudoPassword,
+} from "./credentials.js";
 import {
   DbSessionManager,
   type OracleDbSession,
@@ -82,6 +88,20 @@ const DEFAULT_SSE_PORT = parsePositiveInt(process.env.MCP_SSE_PORT, 3000);
 const commandPolicyConfig = loadCommandPolicyConfig();
 const sqlPolicyConfig = loadSqlPolicyConfig();
 
+const SHARED_CREDENTIAL_INPUTS = {
+  ldapUser: { type: "string" },
+  ldapPassword: { type: "string" },
+  ldapPasswordEncoded: { type: "string" },
+  hostUser: { type: "string" },
+  hostPassword: { type: "string" },
+  hostPasswordEncoded: { type: "string" },
+  dbUser: { type: "string" },
+  dbPassword: { type: "string" },
+  dbPasswordEncoded: { type: "string" },
+  passwordEncoded: { type: "string" },
+  sudoPasswordEncoded: { type: "string" },
+} as const;
+
 const TOOL_DEFINITIONS = [
   {
     name: "ssh_connect",
@@ -89,7 +109,7 @@ const TOOL_DEFINITIONS = [
     inputSchema: {
       type: "object",
       additionalProperties: false,
-      required: ["host", "username", "authMethod"],
+      required: ["host", "authMethod"],
       properties: {
         host: { type: "string" },
         port: { type: "integer", default: 22 },
@@ -103,6 +123,7 @@ const TOOL_DEFINITIONS = [
         passphrase: { type: "string" },
         sessionLabel: { type: "string" },
         connectTimeout: { type: "integer", default: 10000 },
+        ...SHARED_CREDENTIAL_INPUTS,
       },
     },
   },
@@ -122,6 +143,7 @@ const TOOL_DEFINITIONS = [
         stripAnsi: { type: "boolean", default: true },
         approvalId: { type: "string" },
         userConfirmation: { type: "string" },
+        ...SHARED_CREDENTIAL_INPUTS,
       },
     },
   },
@@ -142,6 +164,7 @@ const TOOL_DEFINITIONS = [
         stripAnsi: { type: "boolean", default: true },
         approvalId: { type: "string" },
         userConfirmation: { type: "string" },
+        ...SHARED_CREDENTIAL_INPUTS,
       },
     },
   },
@@ -156,6 +179,24 @@ const TOOL_DEFINITIONS = [
       properties: {
         sessionId: { type: "string" },
         command: { type: "string" },
+      },
+    },
+  },
+  {
+    name: "review_command_batch",
+    description:
+      "Reviews a related set of shell commands together and reports whether the whole batch can auto-run, needs one confirmation, or contains blocked commands.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["commands"],
+      properties: {
+        sessionId: { type: "string" },
+        commands: {
+          type: "array",
+          minItems: 1,
+          items: { type: "string" },
+        },
       },
     },
   },
@@ -188,6 +229,31 @@ const TOOL_DEFINITIONS = [
         waitForOutputMs: { type: "integer", default: 1500 },
         stripAnsi: { type: "boolean", default: true },
         redactInput: { type: "boolean", default: false },
+      },
+    },
+  },
+  {
+    name: "execute_command_batch",
+    description:
+      "Executes a related set of shell commands sequentially in one session. MCP reviews them together so one confirmation can cover the whole batch when needed.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["sessionId", "commands"],
+      properties: {
+        sessionId: { type: "string" },
+        commands: {
+          type: "array",
+          minItems: 1,
+          items: { type: "string" },
+        },
+        timeout: { type: "integer", default: DEFAULT_COMMAND_TIMEOUT_MS },
+        sudoPassword: { type: "string" },
+        stripAnsi: { type: "boolean", default: true },
+        approvalId: { type: "string" },
+        userConfirmation: { type: "string" },
+        stopOnError: { type: "boolean", default: true },
+        ...SHARED_CREDENTIAL_INPUTS,
       },
     },
   },
@@ -250,7 +316,7 @@ const TOOL_DEFINITIONS = [
     inputSchema: {
       type: "object",
       additionalProperties: false,
-      required: ["username", "password"],
+      required: [],
       properties: {
         username: { type: "string" },
         password: { type: "string" },
@@ -266,6 +332,7 @@ const TOOL_DEFINITIONS = [
         walletPassword: { type: "string" },
         httpsProxy: { type: "string" },
         httpsProxyPort: { type: "integer" },
+        ...SHARED_CREDENTIAL_INPUTS,
       },
     },
   },
@@ -528,6 +595,33 @@ function readBinds(
   );
 }
 
+function readStringArray(
+  args: Record<string, unknown>,
+  fieldName: string,
+  required = false,
+): string[] {
+  const value = args[fieldName];
+  if (value == null) {
+    if (required) {
+      throw new HandledError(
+        "INVALID_ARGUMENT",
+        `${fieldName} is required and must be a non-empty array of strings.`,
+      );
+    }
+
+    return [];
+  }
+
+  if (!Array.isArray(value) || value.length === 0 || value.some((entry) => typeof entry !== "string" || entry === "")) {
+    throw new HandledError(
+      "INVALID_ARGUMENT",
+      `${fieldName} must be a non-empty array of non-empty strings.`,
+    );
+  }
+
+  return value;
+}
+
 function readAuthMethod(args: Record<string, unknown>): AuthMethod {
   const authMethod = readString(args, "authMethod", true);
   if (
@@ -615,6 +709,28 @@ function createOrReusePendingApproval(
 
   session.pendingApproval = pendingApproval;
   return pendingApproval;
+}
+
+function summarizeBatchCommands(commands: string[]): string {
+  return commands.map((command, index) => `${index + 1}. ${command}`).join("\n");
+}
+
+function toCommandReviewSummary(review: {
+  command: string;
+  riskLevel: string;
+  category: string;
+  summary: string;
+  decision: string;
+  safeForAutoRun: boolean;
+}): Record<string, unknown> {
+  return {
+    command: review.command,
+    riskLevel: review.riskLevel,
+    category: review.category,
+    summary: review.summary,
+    decision: review.decision,
+    safeForAutoRun: review.safeForAutoRun,
+  };
 }
 
 function ensureCommandApproval(
@@ -749,6 +865,144 @@ function ensureCommandApproval(
     confirmationPrompt: `Command: ${command}\nConsequence: ${review.summary}\nReply with exact CONFIRM before MCP runs it.`,
     instructions:
       `Show the exact command and the consequence summary to the user. Only retry execute_command or start_interactive_command after the user replies with CONFIRM, using approvalId "${pendingApproval.approvalId}" and userConfirmation "CONFIRM".`,
+  });
+}
+
+function ensureCommandBatchApproval(
+  session: ShellSession,
+  commands: string[],
+  approvalId: string | undefined,
+  userConfirmation: string | undefined,
+): {
+  riskLevel: "read-only" | "mutating" | "destructive";
+  category: string;
+  safeForAutoRun: boolean;
+  reviews: ReturnType<typeof summarizeCommandBatchReviews>["reviews"];
+} {
+  const batchReview = summarizeCommandBatchReviews(commands, session, commandPolicyConfig);
+
+  sessionManager.recordAudit({
+    level: batchReview.decision === "blocked" || batchReview.requiresConfirmation ? "warning" : "info",
+    event: "command_reviewed",
+    message: `Reviewed ${batchReview.commandCount} command(s) as one batch with policy decision "${batchReview.decision}".`,
+    sessionId: session.id,
+    host: session.host,
+    username: session.username,
+    command: `batch(${batchReview.commandCount})`,
+    riskLevel: batchReview.riskLevel,
+    details: {
+      category: batchReview.category,
+      summary: batchReview.summary,
+      decision: batchReview.decision,
+      blockedCount: batchReview.blockedCount,
+      approvalRequiredCount: batchReview.approvalRequiredCount,
+      safeForAutoRun: batchReview.safeForAutoRun,
+      commands: batchReview.reviews.map((review) => toCommandReviewSummary(review)),
+    },
+  });
+
+  if (batchReview.decision === "blocked") {
+    session.pendingApproval = undefined;
+
+    sessionManager.recordAudit({
+      level: "warning",
+      event: "command_blocked",
+      message: "Blocked command batch by safety policy.",
+      sessionId: session.id,
+      host: session.host,
+      username: session.username,
+      command: `batch(${batchReview.commandCount})`,
+      riskLevel: batchReview.riskLevel,
+      details: {
+        category: batchReview.category,
+        summary: batchReview.summary,
+        blockedCount: batchReview.blockedCount,
+        approvalRequiredCount: batchReview.approvalRequiredCount,
+        commands: batchReview.reviews.map((review) => toCommandReviewSummary(review)),
+      },
+    });
+
+    throw new HandledError(
+      "POLICY_BLOCKED",
+      "The active MCP policy blocked one or more commands in this batch.",
+      {
+        commandBatchReview: batchReview,
+        instructions:
+          "Use review_command_batch or review_command to inspect the batch, then remove or change the blocked command before retrying.",
+      },
+    );
+  }
+
+  if (!batchReview.requiresConfirmation) {
+    if (session.pendingApproval?.command === batchReview.normalizedBatch) {
+      session.pendingApproval = undefined;
+    }
+
+    return {
+      riskLevel: batchReview.riskLevel,
+      category: batchReview.category,
+      safeForAutoRun: batchReview.safeForAutoRun,
+      reviews: batchReview.reviews,
+    };
+  }
+
+  const pendingApproval = createOrReusePendingApproval(
+    session,
+    batchReview.normalizedBatch,
+    batchReview.riskLevel,
+    "CONFIRM",
+    batchReview.summary,
+  );
+
+  const normalizedConfirmation = userConfirmation ? normalizeApprovalText(userConfirmation) : undefined;
+  const confirmationAccepted =
+    approvalId === pendingApproval.approvalId &&
+    normalizedConfirmation === pendingApproval.requiredConfirmationToken &&
+    pendingApproval.expiresAt > Date.now();
+
+  if (confirmationAccepted) {
+    session.pendingApproval = undefined;
+    return {
+      riskLevel: batchReview.riskLevel,
+      category: batchReview.category,
+      safeForAutoRun: batchReview.safeForAutoRun,
+      reviews: batchReview.reviews,
+    };
+  }
+
+  const message =
+    "User confirmation is required before MCP runs this related command batch because at least one command is outside the explicit safe auto-run list.";
+
+  sessionManager.recordAudit({
+    level: "warning",
+    event: "command_blocked",
+    message,
+    sessionId: session.id,
+    host: session.host,
+    username: session.username,
+    command: `batch(${batchReview.commandCount})`,
+    riskLevel: batchReview.riskLevel,
+    details: {
+      approvalId: pendingApproval.approvalId,
+      requiredConfirmationToken: pendingApproval.requiredConfirmationToken,
+      expiresAt: pendingApproval.expiresAt,
+      providedApprovalId: approvalId ?? null,
+      providedConfirmation: userConfirmation ?? null,
+      category: batchReview.category,
+      summary: batchReview.summary,
+      commands: batchReview.reviews.map((review) => toCommandReviewSummary(review)),
+    },
+  });
+
+  throw new HandledError("CONFIRMATION_REQUIRED", message, {
+    approvalId: pendingApproval.approvalId,
+    requiredConfirmationToken: pendingApproval.requiredConfirmationToken,
+    expiresAt: pendingApproval.expiresAt,
+    commandBatchReview: batchReview,
+    confirmationPrompt:
+      `Commands:\n${summarizeBatchCommands(commands)}\nConsequence: ${batchReview.summary}\nReply with exact CONFIRM before MCP runs this batch.`,
+    instructions:
+      `Show the exact command list and the consequence summary to the user. Only retry execute_command_batch after the user replies with CONFIRM, using approvalId "${pendingApproval.approvalId}" and userConfirmation "CONFIRM".`,
   });
 }
 
@@ -1125,22 +1379,19 @@ function toDbSessionSummary(session: OracleDbSession): Record<string, unknown> {
 async function callSshConnect(args: Record<string, unknown>): Promise<Record<string, unknown>> {
   const host = readString(args, "host", true) ?? "";
   const port = readPositiveInteger(args, "port", 22);
-  const username = readString(args, "username", true) ?? "";
   const authMethod = readAuthMethod(args);
-  const password = readString(args, "password");
-  const privateKey = readString(args, "privateKey");
-  const passphrase = readString(args, "passphrase");
+  const credentials = resolveSshCredentials(args, authMethod);
   const sessionLabel = readString(args, "sessionLabel");
   const connectTimeout = readPositiveInteger(args, "connectTimeout", 10_000);
 
   const session = await connectShellSession({
     host,
     port,
-    username,
+    username: credentials.username,
     authMethod,
-    password,
-    privateKey,
-    passphrase,
+    password: credentials.password,
+    privateKey: credentials.privateKey,
+    passphrase: credentials.passphrase,
     sessionLabel,
     connectTimeout,
     sessionManager,
@@ -1175,7 +1426,7 @@ async function callExecuteCommand(
   const sessionId = readString(args, "sessionId", true) ?? "";
   const command = readString(args, "command", true) ?? "";
   const timeoutMs = readPositiveInteger(args, "timeout", DEFAULT_COMMAND_TIMEOUT_MS);
-  const sudoPassword = readString(args, "sudoPassword");
+  const sudoPassword = resolveSudoPassword(args);
   const stripAnsi = readBoolean(args, "stripAnsi", true);
   const approvalId = readString(args, "approvalId");
   const userConfirmation = readString(args, "userConfirmation");
@@ -1267,7 +1518,7 @@ async function callStartInteractiveCommand(
   const command = readString(args, "command", true) ?? "";
   const timeoutMs = readPositiveInteger(args, "timeout", DEFAULT_COMMAND_TIMEOUT_MS);
   const waitForOutputMs = readPositiveInteger(args, "waitForOutputMs", 1500);
-  const sudoPassword = readString(args, "sudoPassword");
+  const sudoPassword = resolveSudoPassword(args);
   const stripAnsi = readBoolean(args, "stripAnsi", true);
   const approvalId = readString(args, "approvalId");
   const userConfirmation = readString(args, "userConfirmation");
@@ -1364,6 +1615,17 @@ function writeInputToSession(
   } = {},
 ): { controlOnly: boolean } {
   const controlOnly = /^[\x03\x04\r\n]+$/.test(decodedInput);
+  const prompt = analyzeInteractionPrompt(
+    session.activeCommand ? session.activeCommand.buffer : session.buffer,
+    {
+      commandHint: session.activeCommand?.command,
+      sessionReady: session.ready,
+    },
+  );
+  const shouldRedactInput =
+    options.redactInput ||
+    prompt.promptType === "password" ||
+    prompt.promptType === "sudo_password";
 
   if (session.ready && !session.manualMode && !session.activeCommand && !controlOnly) {
     sessionManager.recordAudit({
@@ -1374,7 +1636,7 @@ function writeInputToSession(
       host: session.host,
       username: session.username,
       details: {
-        inputPreview: options.redactInput ? "<redacted>" : sanitizePreview(decodedInput),
+        inputPreview: shouldRedactInput ? "<redacted>" : sanitizePreview(decodedInput),
       },
     });
 
@@ -1409,7 +1671,7 @@ function writeInputToSession(
     username: session.username,
     details: {
       controlOnly,
-      inputPreview: options.redactInput ? "<redacted>" : sanitizePreview(decodedInput),
+      inputPreview: shouldRedactInput ? "<redacted>" : sanitizePreview(decodedInput),
     },
   });
 
@@ -1431,6 +1693,67 @@ async function callWriteStdin(
 
     return { written: true };
   });
+}
+
+async function callReviewCommandBatch(
+  args: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  const sessionId = readString(args, "sessionId");
+  const commands = readStringArray(args, "commands", true);
+  const session = sessionId ? sessionManager.require(sessionId) : undefined;
+  const batchReview = summarizeCommandBatchReviews(commands, session, commandPolicyConfig);
+  const pendingApproval =
+    session && batchReview.requiresConfirmation
+      ? createOrReusePendingApproval(
+          session,
+          batchReview.normalizedBatch,
+          batchReview.riskLevel,
+          "CONFIRM",
+          batchReview.summary,
+        )
+      : undefined;
+
+  sessionManager.recordAudit({
+    level: batchReview.decision === "blocked" || batchReview.requiresConfirmation ? "warning" : "info",
+    event: batchReview.decision === "blocked" ? "command_blocked" : "command_reviewed",
+    message:
+      batchReview.decision === "blocked"
+        ? `Blocked ${batchReview.commandCount} command(s) during batch review.`
+        : `Reviewed ${batchReview.commandCount} command(s) without executing them.`,
+    sessionId: session?.id,
+    host: session?.host,
+    username: session?.username,
+    command: `batch(${batchReview.commandCount})`,
+    riskLevel: batchReview.riskLevel,
+    details: {
+      category: batchReview.category,
+      summary: batchReview.summary,
+      decision: batchReview.decision,
+      blockedCount: batchReview.blockedCount,
+      approvalRequiredCount: batchReview.approvalRequiredCount,
+      approvalId: pendingApproval?.approvalId ?? null,
+      requiredConfirmationToken: pendingApproval?.requiredConfirmationToken ?? null,
+      expiresAt: pendingApproval?.expiresAt ?? null,
+      commands: batchReview.reviews.map((review) => toCommandReviewSummary(review)),
+    },
+  });
+
+  return {
+    sessionId: session?.id ?? null,
+    commandCount: batchReview.commandCount,
+    riskLevel: batchReview.riskLevel,
+    category: batchReview.category,
+    decision: batchReview.decision,
+    summary: batchReview.summary,
+    requiresConfirmation: batchReview.requiresConfirmation,
+    safeForAutoRun: batchReview.safeForAutoRun,
+    blockedCount: batchReview.blockedCount,
+    approvalRequiredCount: batchReview.approvalRequiredCount,
+    commands: batchReview.reviews.map((review) => ({
+      ...review,
+    })),
+    pendingApproval: toPendingApprovalSummary(pendingApproval),
+  };
 }
 
 async function callSendInteractionInput(
@@ -1469,6 +1792,173 @@ async function callSendInteractionInput(
       adoptedEffectiveUser: adoption.effectiveUser,
       ...(adoption.adoptionError ? { adoptionError: adoption.adoptionError } : {}),
       interaction: buildInteractionState(session, stripAnsi),
+    };
+  });
+}
+
+async function callExecuteCommandBatch(
+  args: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  const sessionId = readString(args, "sessionId", true) ?? "";
+  const commands = readStringArray(args, "commands", true);
+  const timeoutMs = readPositiveInteger(args, "timeout", DEFAULT_COMMAND_TIMEOUT_MS);
+  const sudoPassword = resolveSudoPassword(args);
+  const stripAnsi = readBoolean(args, "stripAnsi", true);
+  const approvalId = readString(args, "approvalId");
+  const userConfirmation = readString(args, "userConfirmation");
+  const stopOnError = readBoolean(args, "stopOnError", true);
+  const session = sessionManager.require(sessionId);
+
+  return await runExclusiveShellOperation(session, "execute_command_batch", async () => {
+    const policy = ensureCommandBatchApproval(session, commands, approvalId, userConfirmation);
+    const results: Array<Record<string, unknown>> = [];
+
+    sessionManager.recordAudit({
+      level: "info",
+      event: "command_started",
+      message: `Started execution of a ${policy.riskLevel} command batch with ${commands.length} command(s).`,
+      sessionId: session.id,
+      host: session.host,
+      username: session.username,
+      command: `batch(${commands.length})`,
+      riskLevel: policy.riskLevel,
+      details: {
+        category: policy.category,
+        timeoutMs,
+        confirmationUsed: Boolean(userConfirmation),
+        executionMode: "batch",
+        stopOnError,
+      },
+    });
+
+    for (let index = 0; index < commands.length; index += 1) {
+      const command = commands[index] ?? "";
+      const commandPolicy = policy.reviews[index];
+
+      sessionManager.recordAudit({
+        level: "info",
+        event: "command_started",
+        message: `Started batch command ${index + 1} of ${commands.length}.`,
+        sessionId: session.id,
+        host: session.host,
+        username: session.username,
+        command,
+        riskLevel: commandPolicy?.riskLevel ?? policy.riskLevel,
+        details: {
+          category: commandPolicy?.category ?? policy.category,
+          timeoutMs,
+          executionMode: "batch",
+          batchIndex: index + 1,
+          batchSize: commands.length,
+        },
+      });
+
+      try {
+        const result = await executeCommand(session, command, {
+          timeoutMs,
+          sudoPassword,
+          stripAnsiOutput: stripAnsi,
+        });
+
+        sessionManager.recordAudit({
+          level: "info",
+          event: "command_completed",
+          message: `Completed batch command ${index + 1} of ${commands.length} with exit code ${result.exitCode}.`,
+          sessionId: session.id,
+          host: session.host,
+          username: session.username,
+          command,
+          riskLevel: commandPolicy?.riskLevel ?? policy.riskLevel,
+          details: {
+            category: commandPolicy?.category ?? policy.category,
+            exitCode: result.exitCode,
+            executionMs: result.executionMs,
+            executionMode: "batch",
+            batchIndex: index + 1,
+            batchSize: commands.length,
+          },
+        });
+
+        results.push({
+          command,
+          index,
+          ...result,
+          policy: {
+            riskLevel: commandPolicy?.riskLevel ?? policy.riskLevel,
+            category: commandPolicy?.category ?? policy.category,
+          },
+          interaction: buildInteractionState(session, stripAnsi),
+        });
+      } catch (error) {
+        if (error instanceof HandledError) {
+          error.details["batchResults"] = results;
+          error.details["failedCommand"] = command;
+          error.details["failedCommandIndex"] = index;
+          error.details["batchSize"] = commands.length;
+
+          sessionManager.recordAudit({
+            level: error.code === "TIMEOUT" ? "warning" : "error",
+            event: error.code === "TIMEOUT" ? "command_timed_out" : "command_failed",
+            message: `Batch command ${index + 1} of ${commands.length} failed: ${error.message}`,
+            sessionId: session.id,
+            host: session.host,
+            username: session.username,
+            command,
+            riskLevel: commandPolicy?.riskLevel ?? policy.riskLevel,
+            details: {
+              category: commandPolicy?.category ?? policy.category,
+              executionMode: "batch",
+              batchIndex: index + 1,
+              batchSize: commands.length,
+              ...error.details,
+            },
+          });
+        }
+
+        if (stopOnError) {
+          throw error;
+        }
+
+        results.push({
+          command,
+          index,
+          error: normalizeToolError(error),
+          policy: {
+            riskLevel: commandPolicy?.riskLevel ?? policy.riskLevel,
+            category: commandPolicy?.category ?? policy.category,
+          },
+          interaction: buildInteractionState(session, stripAnsi),
+        });
+      }
+    }
+
+    sessionManager.recordAudit({
+      level: "info",
+      event: "command_completed",
+      message: `Completed execution of a command batch with ${commands.length} command(s).`,
+      sessionId: session.id,
+      host: session.host,
+      username: session.username,
+      command: `batch(${commands.length})`,
+      riskLevel: policy.riskLevel,
+      details: {
+        category: policy.category,
+        executionMode: "batch",
+        completedCount: results.length,
+        stopOnError,
+      },
+    });
+
+    return {
+      executed: true,
+      commandCount: commands.length,
+      completedCount: results.length,
+      stopOnError,
+      policy: {
+        riskLevel: policy.riskLevel,
+        category: policy.category,
+      },
+      results,
     };
   });
 }
@@ -1643,8 +2133,7 @@ async function callListSessions(): Promise<Record<string, unknown>> {
 }
 
 async function callOracleConnect(args: Record<string, unknown>): Promise<Record<string, unknown>> {
-  const username = readString(args, "username", true) ?? "";
-  const password = readString(args, "password", true) ?? "";
+  const credentials = resolveOracleCredentials(args);
   const connectString = readString(args, "connectString");
   const host = readString(args, "host");
   const port = readPositiveInteger(args, "port", 1521);
@@ -1668,8 +2157,8 @@ async function callOracleConnect(args: Record<string, unknown>): Promise<Record<
 
   const session = await connectOracleSession(
     {
-      username,
-      password,
+      username: credentials.username,
+      password: credentials.password,
       connectString,
       host,
       port,
@@ -2069,8 +2558,12 @@ function buildServer() {
         return await safeToolCall(() => callExecuteCommand(args));
       case "start_interactive_command":
         return await safeToolCall(() => callStartInteractiveCommand(args));
+      case "execute_command_batch":
+        return await safeToolCall(() => callExecuteCommandBatch(args));
       case "review_command":
         return await safeToolCall(() => callReviewCommand(args));
+      case "review_command_batch":
+        return await safeToolCall(() => callReviewCommandBatch(args));
       case "write_stdin":
         return await safeToolCall(() => callWriteStdin(args));
       case "send_interaction_input":

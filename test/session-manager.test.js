@@ -80,3 +80,37 @@ test("session manager enforces max session capacity", () => {
     manager.dispose();
   }
 });
+
+test("session manager masks secret-like audit fields", () => {
+  const manager = new SessionManager({
+    idleTimeoutMs: 60_000,
+    maxSessions: 1,
+    closeSession() {},
+  });
+
+  try {
+    manager.recordAudit({
+      level: "info",
+      event: "stdin_written",
+      message: "Provided password: Oracle1234",
+      sessionId: "session-a",
+      host: "nms-host",
+      username: "nmsadmin",
+      details: {
+        sudoPassword: "Oracle1234",
+        walletPassword: "WalletSecret",
+        nested: {
+          dbPassword: "DbSecret",
+        },
+      },
+    });
+
+    const [entry] = manager.listAudit({ limit: 1 });
+    assert.equal(entry.message, "Provided password: <redacted>");
+    assert.equal(entry.details?.sudoPassword, "<redacted>");
+    assert.equal(entry.details?.walletPassword, "<redacted>");
+    assert.equal(entry.details?.nested?.dbPassword, "<redacted>");
+  } finally {
+    manager.dispose();
+  }
+});

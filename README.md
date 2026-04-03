@@ -44,6 +44,7 @@ Shell and transport:
 - `MCP_SSH_DEFAULT_TIMEOUT_MS` default `30000`
 - `MCP_SSH_APPROVAL_TTL_MS` default `600000`
 - `MCP_SSH_MAX_SESSIONS` default `10`
+- `MCP_SSH_ALGORITHM_PROFILE` default `compat`; use `default` to fall back to the raw `ssh2` algorithm order
 - `MCP_SSH_POLICY_FILE` optional path to a custom JSON policy file
 - `MCP_TRANSPORT` `stdio` or `sse`, default `stdio`
 - `MCP_SSE_PORT` default `3000`
@@ -70,7 +71,9 @@ Shell tools:
 
 - `ssh_connect`
 - `review_command`
+- `review_command_batch`
 - `execute_command`
+- `execute_command_batch`
 - `start_interactive_command`
 - `write_stdin`
 - `send_interaction_input`
@@ -103,6 +106,8 @@ The server does not trust user intent or agent intent. It reviews the exact comm
 
 For simple commands, use `execute_command`.
 
+For a related sequence of standalone checks on the same host, use `execute_command_batch` so MCP can review the whole set together and, when needed, ask for one shared confirmation instead of one prompt per command.
+
 For anything that may prompt, stream, or open a REPL, use the guided interactive flow:
 
 1. `start_interactive_command`
@@ -134,12 +139,36 @@ These commands can auto-run when MCP can clearly recognize them and does not det
 - `cat`
 - `ps`
 - `tail`
+- `head`
+- `sort`
+- `uniq`
+- `wc`
+- `echo`
+- `printf`
+- `hostname`
+- `whoami`
+- `id`
+- `date`
+- `uname`
+- `env`
+- `printenv`
+- `command`
+- `type`
+- `ss`
+- `netstat`
+- `lsof`
+- `readlink`
+- `realpath`
+- `smsReport`
 - `ISQL` read-only `SELECT` commands only
 - `ISQL -admin` read-only `SELECT` commands only
 
 Notes:
 
 - `cd` is treated as low-impact and allowed because it only changes the active shell directory
+- Read-only standalone diagnostics under `sudo -u <targetUser>` can auto-run when MCP can still clearly recognize the underlying command as safe
+- Prefer standalone commands such as `sudo -u esb8 smsReport`, `sudo -u esb8 grep ...`, `sudo -u esb8 find ...`, or `sudo -u esb8 ps ...` over one large `bash -lc '...'` bundle whenever possible
+- After switching to or adopting a target user shell, do not source `.bashrc`, `.profile`, or similar login files unless the command truly depends on extra environment setup
 - Commands that start interactive terminal programs such as `python`, `sqlplus`, `ISQL`, `tail -f`, `less`, `top`, or `ssh` are not treated as safe auto-run commands
 - If MCP sees shell redirection to files, inline scripts, `sudo`, or other risky patterns, it will stop auto-running and ask first
 - If MCP is not confident that a custom project command is harmless, it asks first
@@ -163,12 +192,14 @@ Anything outside the safe auto-run lists requires explicit user confirmation.
 What MCP returns:
 
 - `decision: "allow"` for explicit safe commands or queries
+- `decision: "allow"` for safe read-only command batches whose individual commands are all recognized as low risk
 - `decision: "approval_required"` for unknown, custom, mutating, or higher-risk actions
 - `decision: "blocked"` only when a deny rule or explicit blocked category in your policy file says MCP must refuse it entirely
 
 Confirmation rule:
 
 - MCP asks the agent to show the exact command or SQL and a simple consequence summary
+- For `execute_command_batch`, MCP can ask once for the whole related command set
 - The user must reply with exact `CONFIRM`
 - The agent must retry with the returned `approvalId` and `userConfirmation: "CONFIRM"`
 - MCP should never self-confirm
@@ -240,6 +271,7 @@ Good uses:
 - SSH tools for host state, WebLogic status, log reading, process inspection, `.nmsrc` setup, and NMS utility checks
 - Oracle DB tools for safe read-only queries, counts, data checks, schema context checks, and troubleshooting evidence
 - `review_command` for custom project commands when MCP is not fully certain
+- `review_command_batch` and `execute_command_batch` for a human-style sequence of related standalone checks on the same host
 - `review_sql` for any SQL beyond a plain safe `SELECT`
 
 Required behavior:
@@ -249,6 +281,7 @@ Required behavior:
 3. Never self-supply `CONFIRM`.
 4. Treat `POLICY_BLOCKED` as final unless a human intentionally changes the policy file.
 5. Check the audit log when you need proof of what MCP reviewed or executed.
+6. Prefer standalone checks over bundled shell scripts whenever possible. Run `smsReport`, then `grep`, then `find`, instead of one giant quoted shell command that has to be mentally unpacked later.
 
 ## Run
 
@@ -366,8 +399,8 @@ SSH:
 
 1. Call `ssh_connect`.
 2. Call `review_command` for anything outside the obvious safe list or when you want MCP to explain the risk before asking the user.
-3. Use `execute_command` for one-shot commands, or `start_interactive_command` for prompt-driven commands.
-4. If MCP returns `CONFIRMATION_REQUIRED`, show the exact command and the summary, then retry with the same `approvalId` and `userConfirmation: "CONFIRM"`.
+3. Use `execute_command` for one-shot commands, `execute_command_batch` for a related set of standalone checks, or `start_interactive_command` for prompt-driven commands.
+4. If MCP returns `CONFIRMATION_REQUIRED`, show the exact command or command set plus the summary, then retry with the same `approvalId` and `userConfirmation: "CONFIRM"`.
 5. For interactive runs, inspect `read_interaction_state` and continue with `send_interaction_input`.
 
 Oracle DB:

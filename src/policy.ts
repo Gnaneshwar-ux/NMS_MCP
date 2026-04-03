@@ -40,11 +40,49 @@ const SAFE_AUTO_RUN_COMMANDS = new Set([
   "pwd",
   "cd",
   "grep",
+  "egrep",
+  "fgrep",
   "find",
   "locate",
   "cat",
   "ps",
   "tail",
+  "head",
+  "sort",
+  "uniq",
+  "wc",
+  "echo",
+  "printf",
+  "hostname",
+  "whoami",
+  "id",
+  "date",
+  "uname",
+  "env",
+  "printenv",
+  "command",
+  "type",
+  "ss",
+  "netstat",
+  "lsof",
+  "readlink",
+  "realpath",
+  "smsreport",
+]);
+
+const SAFE_TRANSIENT_SESSION_COMMANDS = new Set([
+  "cd",
+  "pushd",
+  "popd",
+  "source",
+  "export",
+  "unset",
+  "alias",
+  "unalias",
+  "umask",
+  "set",
+  "declare",
+  "typeset",
 ]);
 
 const DESTRUCTIVE_RULES: MatchRule[] = [
@@ -222,6 +260,36 @@ function unwrapLeadingSudo(command: string): {
   };
 }
 
+function unwrapOneShotShellWrapper(command: string): {
+  analysisTarget: string;
+  wrappedInOneShotShell: boolean;
+} {
+  const patterns = [
+    /^\s*(?:\S*\/)?(?:bash|sh|ksh|zsh)\s+-lc\s+(['"])([\s\S]*)\1\s*$/i,
+    /^\s*(?:\S*\/)?(?:bash|sh|ksh|zsh)\s+-cl\s+(['"])([\s\S]*)\1\s*$/i,
+    /^\s*(?:\S*\/)?(?:bash|sh|ksh|zsh)\s+-c\s+(['"])([\s\S]*)\1\s*$/i,
+    /^\s*(?:\S*\/)?(?:bash|sh|ksh|zsh)\s+--login\s+-c\s+(['"])([\s\S]*)\1\s*$/i,
+    /^\s*(?:\S*\/)?(?:bash|sh|ksh|zsh)\s+-l\s+-c\s+(['"])([\s\S]*)\1\s*$/i,
+  ];
+
+  for (const pattern of patterns) {
+    const match = command.match(pattern);
+    if (!match) {
+      continue;
+    }
+
+    return {
+      analysisTarget: normalizeCommand(match[2] ?? command),
+      wrappedInOneShotShell: true,
+    };
+  }
+
+  return {
+    analysisTarget: command,
+    wrappedInOneShotShell: false,
+  };
+}
+
 function containsOpaqueInlineScript(command: string): boolean {
   return (
     /\b(?:bash|sh|python(?:3)?|perl|ruby|node)\s+-[ce]\b/i.test(command) ||
@@ -252,9 +320,86 @@ function matchRules(command: string, rules: MatchRule[]): MatchRule[] {
   return rules.filter((rule) => rule.regex.test(command));
 }
 
+function splitTopLevelCommands(command: string): string[] {
+  const segments: string[] = [];
+  let current = "";
+  let inSingleQuote = false;
+  let inDoubleQuote = false;
+  let escaped = false;
+
+  for (let index = 0; index < command.length; index += 1) {
+    const character = command[index] ?? "";
+    const nextCharacter = command[index + 1] ?? "";
+
+    if (escaped) {
+      current += character;
+      escaped = false;
+      continue;
+    }
+
+    if (character === "\\" && !inSingleQuote) {
+      current += character;
+      escaped = true;
+      continue;
+    }
+
+    if (character === "'" && !inDoubleQuote) {
+      inSingleQuote = !inSingleQuote;
+      current += character;
+      continue;
+    }
+
+    if (character === '"' && !inSingleQuote) {
+      inDoubleQuote = !inDoubleQuote;
+      current += character;
+      continue;
+    }
+
+    if (!inSingleQuote && !inDoubleQuote) {
+      const isSeparator =
+        character === ";" ||
+        character === "\n" ||
+        (character === "&" && nextCharacter === "&") ||
+        (character === "|" && nextCharacter === "|");
+
+      if (isSeparator) {
+        const trimmed = normalizeCommand(current);
+        if (trimmed) {
+          segments.push(trimmed);
+        }
+
+        current = "";
+        if ((character === "&" || character === "|") && nextCharacter === character) {
+          index += 1;
+        }
+        continue;
+      }
+    }
+
+    current += character;
+  }
+
+  const trailing = normalizeCommand(current);
+  if (trailing) {
+    segments.push(trailing);
+  }
+
+  return segments;
+}
+
 function getLeadingCommandName(command: string): string | undefined {
   const match = command.match(/^\s*([A-Za-z_][A-Za-z0-9._-]*)\b/);
   return match?.[1]?.toLowerCase();
+}
+
+function isTransientSessionSetupSegment(segment: string): boolean {
+  const normalized = stripLeadingEnvAssignments(segment).trim();
+  if (/^\.\s+/.test(normalized)) {
+    return true;
+  }
+
+  const leadingCommand = getLeadingCommandName(normalized);
+  return Boolean(leadingCommand && SAFE_TRANSIENT_SESSION_COMMANDS.has(leadingCommand));
 }
 
 function isReadOnlyIsqlCommand(command: string): boolean {
@@ -277,6 +422,30 @@ function buildReadOnlySummary(command: string): {
   summary: string;
   knownSafeAutoRun: boolean;
 } {
+  const segments = splitTopLevelCommands(command);
+  if (
+    segments.length > 1 &&
+    segments.every((segment) => {
+      const normalizedSegment = stripLeadingEnvAssignments(segment).trim();
+      if (!normalizedSegment) {
+        return true;
+      }
+
+      if (isReadOnlyIsqlCommand(normalizedSegment)) {
+        return true;
+      }
+
+      const leadingCommand = getLeadingCommandName(normalizedSegment);
+      return Boolean(leadingCommand && SAFE_AUTO_RUN_COMMANDS.has(leadingCommand));
+    })
+  ) {
+    return {
+      category: "diagnostic-bundle",
+      summary: "Explicitly allowed read-only diagnostic command bundle.",
+      knownSafeAutoRun: true,
+    };
+  }
+
   const leadingCommand = getLeadingCommandName(command);
   if (leadingCommand && SAFE_AUTO_RUN_COMMANDS.has(leadingCommand)) {
     return {
@@ -333,8 +502,8 @@ function decideCommandPolicy(
     riskLevel: CommandRiskLevel;
     category: string;
     usesSudo: boolean;
+    elevatesShell: boolean;
     opaqueInlineScript: boolean;
-    sessionIsSudo: boolean;
     knownSafeAutoRun: boolean;
   },
   config: CommandPolicyConfig,
@@ -356,8 +525,9 @@ function decideCommandPolicy(
   if (matchedAllowRule) {
     if (
       (input.riskLevel === "read-only" || input.category === "session-state") &&
-      !input.usesSudo &&
-      !input.sessionIsSudo
+      !input.opaqueInlineScript &&
+      !input.elevatesShell &&
+      (!input.usesSudo || input.riskLevel === "read-only")
     ) {
       return {
         decision: matchedAllowRule.decision,
@@ -385,9 +555,9 @@ function decideCommandPolicy(
 
   if (
     input.knownSafeAutoRun &&
-    !input.usesSudo &&
-    !input.sessionIsSudo &&
     !input.opaqueInlineScript
+    && !input.elevatesShell
+    && (!input.usesSudo || input.riskLevel === "read-only")
   ) {
     return {
       decision: "allow",
@@ -412,7 +582,8 @@ export function reviewCommandPolicy(
   const normalizedCommand = normalizeCommand(command);
   const withoutAssignments = stripLeadingEnvAssignments(normalizedCommand);
   const sudoState = unwrapLeadingSudo(withoutAssignments);
-  const analysisTarget = sudoState.analysisTarget;
+  const shellWrapperState = unwrapOneShotShellWrapper(sudoState.analysisTarget);
+  const analysisTarget = shellWrapperState.analysisTarget;
   const leadingCommand = getLeadingCommandName(analysisTarget);
   const reasons = new Set<string>();
 
@@ -450,11 +621,46 @@ export function reviewCommandPolicy(
   let category = "general-shell";
   let summary = "";
   let knownSafeAutoRun = false;
+  const hasOnlyTransientSessionSetup =
+    shellWrapperState.wrappedInOneShotShell &&
+    splitTopLevelCommands(analysisTarget).every((segment) => {
+      const normalizedSegment = stripLeadingEnvAssignments(segment).trim();
+      return (
+        !normalizedSegment ||
+        isTransientSessionSetupSegment(normalizedSegment) ||
+        isReadOnlyIsqlCommand(normalizedSegment) ||
+        Boolean(
+          getLeadingCommandName(normalizedSegment) &&
+            SAFE_AUTO_RUN_COMMANDS.has(getLeadingCommandName(normalizedSegment) ?? ""),
+        )
+      );
+    });
 
   if (destructiveMatches.length > 0) {
     riskLevel = "destructive";
     category = destructiveMatches[0]?.category ?? category;
     summary = destructiveMatches[0]?.summary ?? summary;
+  } else if (
+    shellWrapperState.wrappedInOneShotShell &&
+    mutatingMatches.length > 0 &&
+    mutatingMatches.every((match) => match.category === "session-state") &&
+    !fileRedirection &&
+    !opaqueInlineScript &&
+    !interactiveCommand &&
+    hasOnlyTransientSessionSetup
+  ) {
+    const readOnlySummary = buildReadOnlySummary(
+      splitTopLevelCommands(analysisTarget)
+        .filter((segment) => !isTransientSessionSetupSegment(segment))
+        .join("; "),
+    );
+    riskLevel = "read-only";
+    category = "diagnostic-bundle";
+    summary =
+      readOnlySummary.knownSafeAutoRun
+        ? "One-shot shell wrapper with transient environment setup and read-only diagnostics."
+        : "One-shot shell wrapper that only changes transient shell state for read-only diagnostics.";
+    knownSafeAutoRun = true;
   } else if (
     leadingCommand === "cd" &&
     mutatingMatches.every((match) => match.category === "session-state") &&
@@ -500,8 +706,8 @@ export function reviewCommandPolicy(
       riskLevel,
       category,
       usesSudo: sudoState.usesSudo,
+      elevatesShell: sudoState.elevatesShell,
       opaqueInlineScript,
-      sessionIsSudo: Boolean(session?.isSudo),
       knownSafeAutoRun,
     },
     config,

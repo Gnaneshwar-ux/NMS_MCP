@@ -125,6 +125,47 @@ export interface ShellSession {
   pendingApproval?: PendingApproval;
 }
 
+const REDACTED_SECRET = "<redacted>";
+const SENSITIVE_AUDIT_KEY_PATTERN = /password|passphrase|secret/i;
+const INLINE_SECRET_PATTERN =
+  /\b(password|passphrase|secret)\b(\s*(?:for [^:\n=]+)?\s*[:=]\s*)([^\s,;]+)/gi;
+
+function sanitizeAuditString(value: string): string {
+  return value.replace(
+    INLINE_SECRET_PATTERN,
+    (_match, label: string, separator: string) => `${label}${separator}${REDACTED_SECRET}`,
+  );
+}
+
+function sanitizeAuditValue(value: unknown, key?: string): unknown {
+  if (value == null || typeof value === "number" || typeof value === "boolean") {
+    return value;
+  }
+
+  if (typeof value === "string") {
+    if (key && SENSITIVE_AUDIT_KEY_PATTERN.test(key)) {
+      return REDACTED_SECRET;
+    }
+
+    return sanitizeAuditString(value);
+  }
+
+  if (Array.isArray(value)) {
+    return value.map((entry) => sanitizeAuditValue(entry));
+  }
+
+  if (typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([entryKey, entryValue]) => [
+        entryKey,
+        sanitizeAuditValue(entryValue, entryKey),
+      ]),
+    );
+  }
+
+  return String(value);
+}
+
 interface SessionManagerOptions {
   idleTimeoutMs: number;
   maxSessions: number;
@@ -306,7 +347,7 @@ export class SessionManager {
   recordAudit(entry: Omit<AuditEntry, "timestamp">): AuditEntry {
     const finalized: AuditEntry = {
       timestamp: Date.now(),
-      ...entry,
+      ...(sanitizeAuditValue(entry) as Omit<AuditEntry, "timestamp">),
     };
 
     this.auditEntries.push(finalized);

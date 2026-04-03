@@ -1,25 +1,62 @@
 {
-  "blockedCategories": [],
+  "blockedCategories": [
+    "privilege-escalation",
+    "password-change",
+    "sudoers-change",
+    "account-change",
+    "service-change",
+    "data-delete",
+    "package-remove",
+    "package-install",
+    "database-destructive",
+    "deploy-change",
+    "container-delete",
+    "git-destructive"
+  ],
   "approvalCategories": [
-    "session-state"
+    "session-state",
+    "privileged-command",
+    "shell-wrapper",
+    "interactive-terminal",
+    "file-write",
+    "scratch-write",
+    "opaque-script"
+  ],
+  "approvedScratchPaths": [
+    "/tmp",
+    "/var/tmp",
+    "/opt/nms/mcp-scratch"
+  ],
+  "diagnosticsProfiles": [
+    "oracle-nms-readonly"
   ],
   "allowRules": [
     {
-      "name": "allow-touch-probe",
-      "regex": "^touch /tmp/mcp_allow_probe$",
+      "name": "allow-exact-nmsrc-check",
+      "regex": "^bash -lc 'source ~/.nmsrc >/dev/null 2>&1; hostname; whoami'$",
+      "decision": "allow",
+      "reason": "Permit this exact read-only .nmsrc validation bundle without extra confirmation."
+    },
+    {
+      "name": "approve-one-scratch-probe",
+      "regex": "^printf 'healthcheck\\\\n' > /opt/nms/mcp-scratch/healthcheck.txt$",
       "decision": "approval_required",
-      "reason": "Permit this one scratch-file probe after explicit confirmation."
+      "reason": "Permit this exact scratch-path probe after explicit confirmation."
     }
   ],
   "denyRules": [
     {
-      "name": "block-service-restarts",
-      "regex": "\\b(systemctl|service)\\b.*\\b(start|stop|restart|reload)\\b",
-      "reason": "Prevent service interruption from the MCP server."
+      "name": "deny-sudo-anywhere",
+      "regex": "(?:^|[;&|()\\\\s])sudo(?:\\\\s|$)",
+      "reason": "Force every sudo-based command through the built-in privilege review path."
     }
   ],
   "sqlPolicy": {
-    "blockedCategories": [],
+    "blockedCategories": [
+      "ddl-destructive",
+      "db-admin",
+      "lock-control"
+    ],
     "approvalCategories": [
       "session-state"
     ],
@@ -34,7 +71,7 @@
     "denyRules": [
       {
         "name": "block-select-for-update",
-        "regex": "\\bfor\\s+update\\b",
+        "regex": "\\\\bfor\\\\s+update\\\\b",
         "reason": "Prevent lock-taking SQL from the MCP server."
       }
     ]

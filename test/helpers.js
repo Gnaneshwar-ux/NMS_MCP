@@ -15,6 +15,7 @@ export function createFakeSession(options = {}) {
       setWindow() {},
     },
     buffer: options.buffer ?? "",
+    recentBuffer: options.recentBuffer ?? options.buffer ?? "",
     ready: options.ready ?? true,
     host: options.host ?? "nms-host",
     username,

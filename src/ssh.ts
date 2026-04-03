@@ -348,6 +348,7 @@ function attachSessionListeners(session: ShellSession, sessionManager: SessionMa
   const onData = (chunk: Buffer | string): void => {
     const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
     session.buffer = appendRollingBuffer(session.buffer, text, DEFAULT_BUFFER_LIMIT);
+    session.recentBuffer = appendRollingBuffer(session.recentBuffer, text, DEFAULT_BUFFER_LIMIT);
 
     if (session.activeCommand) {
       session.activeCommand.buffer = appendRollingBuffer(
@@ -421,6 +422,7 @@ export async function connectShellSession(options: ConnectShellOptions): Promise
     client: readyConnection.client,
     shell: readyConnection.shell,
     buffer: "",
+    recentBuffer: "",
     ready: false,
     host: options.host,
     username: options.username,
@@ -458,6 +460,7 @@ export async function connectShellSession(options: ConnectShellOptions): Promise
 
     session.serverBanner = combinedBanner || undefined;
     session.buffer = "";
+    session.recentBuffer = "";
     session.ready = true;
     session.lastUsedAt = Date.now();
     options.sessionManager.add(session);

@@ -105,6 +105,8 @@ function beginCommand(
   const preparedCommand = rewriteSudoCommandWithPassword(command, options.sudoPassword);
   const submittedCommand = buildWrappedCommand(preparedCommand.rewrittenCommand, sentinelId);
 
+  session.recentBuffer = "";
+
   session.activeCommand = {
     command,
     submittedCommand,
@@ -307,6 +309,7 @@ export async function interruptSession(
 
   if (options.clearBuffer) {
     session.buffer = "";
+    session.recentBuffer = "";
   }
 
   session.shell.write(signalText);
@@ -318,6 +321,25 @@ export async function interruptSession(
   return {
     sessionReady,
     clearedActiveCommand,
+  };
+}
+
+export function getVisibleInteractionBuffers(
+  session: ShellSession,
+): {
+  outputBuffer: string;
+  promptBuffer: string;
+} {
+  if (session.activeCommand) {
+    return {
+      outputBuffer: session.activeCommand.buffer,
+      promptBuffer: session.activeCommand.buffer,
+    };
+  }
+
+  return {
+    outputBuffer: session.recentBuffer,
+    promptBuffer: session.recentBuffer || session.buffer,
   };
 }
 

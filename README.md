@@ -167,11 +167,12 @@ These commands can auto-run when MCP can clearly recognize them and does not det
 Notes:
 
 - `cd` is treated as low-impact and allowed because it only changes the active shell directory
-- Read-only standalone diagnostics under `sudo -u <targetUser>` can auto-run when MCP can still clearly recognize the underlying command as safe
-- Prefer standalone commands such as `sudo -u esb8 smsReport`, `sudo -u esb8 grep ...`, `sudo -u esb8 find ...`, or `sudo -u esb8 ps ...` over one large `bash -lc '...'` bundle whenever possible
+- Exact Oracle NMS read-only diagnostics such as `hostname`, `whoami`, `id`, `getent`, `grep -n ... | head`, `ps -ef | grep ... | grep -v grep`, `find ... | sort | tail`, `ss -ltn`, and exact `.nmsrc` validation bundles can auto-run when they match the built-in diagnostics profile
+- Any command containing `sudo` is higher scrutiny and requires confirmation at minimum; shell-elevating privilege changes can be blocked entirely by policy
+- Prefer plain read-only diagnostics or exact `.nmsrc` wrappers over privilege-changing bundles whenever possible
 - After switching to or adopting a target user shell, do not source `.bashrc`, `.profile`, or similar login files unless the command truly depends on extra environment setup
 - Commands that start interactive terminal programs such as `python`, `sqlplus`, `ISQL`, `tail -f`, `less`, `top`, or `ssh` are not treated as safe auto-run commands
-- If MCP sees shell redirection to files, inline scripts, `sudo`, or other risky patterns, it will stop auto-running and ask first
+- If MCP sees shell redirection to files, heredocs, inline scripts, `sudo`, or other risky patterns, it will stop auto-running and ask first
 - If MCP is not confident that a custom project command is harmless, it asks first
 
 ### Safe SQL auto-run list
@@ -227,19 +228,35 @@ Current policy file model:
 - Nested `sqlPolicy` fields apply to Oracle SQL policy
 - `denyRules` always win over `allowRules`
 - `blockedCategories` are for commands or SQL you want MCP to hard-refuse
+- `approvalCategories` are for categories that should always require confirmation
+- `approvedScratchPaths` define the only scratch paths MCP will treat as explicitly approved write targets
+- `diagnosticsProfiles` enable exact built-in read-only command bundles such as the Oracle NMS diagnostics profile
 - `allowRules` are for narrow exceptions you want MCP to recognize explicitly
 
 Default files:
 
-- [ssh-mcp-policy.json](./ssh-mcp-policy.json) keeps hard blocks empty by default and relies on the safe auto-run list plus confirmation flow
+- [ssh-mcp-policy.json](./ssh-mcp-policy.json) blocks high-risk admin categories by default and enables the exact Oracle NMS read-only diagnostics profile
 - [ssh-mcp-policy.example.json](./ssh-mcp-policy.example.json) shows how to deny dangerous patterns and allow very narrow exceptions
 
 ### Policy file shape
 
 ```json
 {
-  "blockedCategories": [],
-  "approvalCategories": ["session-state"],
+  "blockedCategories": [
+    "privilege-escalation",
+    "password-change"
+  ],
+  "approvalCategories": [
+    "session-state",
+    "privileged-command"
+  ],
+  "approvedScratchPaths": [
+    "/tmp",
+    "/var/tmp"
+  ],
+  "diagnosticsProfiles": [
+    "oracle-nms-readonly"
+  ],
   "allowRules": [],
   "denyRules": [
     {
@@ -249,7 +266,10 @@ Default files:
     }
   ],
   "sqlPolicy": {
-    "blockedCategories": [],
+    "blockedCategories": [
+      "ddl-destructive",
+      "lock-control"
+    ],
     "approvalCategories": ["session-state"],
     "allowRules": [],
     "denyRules": [

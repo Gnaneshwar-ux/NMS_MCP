@@ -103,6 +103,7 @@ export interface ShellSession {
   client: Client;
   shell: ClientChannel;
   buffer: string;
+  recentBuffer: string;
   ready: boolean;
   host: string;
   username: string;
@@ -336,6 +337,7 @@ export class SessionManager {
 
   clearBuffer(session: ShellSession, includeActiveCommand = true): void {
     session.buffer = "";
+    session.recentBuffer = "";
     if (includeActiveCommand && session.activeCommand) {
       session.activeCommand.buffer = "";
       session.activeCommand.lastSudoPromptBufferLength = 0;

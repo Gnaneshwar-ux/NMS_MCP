@@ -279,6 +279,13 @@ function decideSqlPolicy(
     };
   }
 
+  if (config.approvalCategories.includes(input.category)) {
+    return {
+      decision: "approval_required",
+      decisionReason: "Active policy requires confirmation for this SQL category before MCP can run it.",
+    };
+  }
+
   if (input.knownSafeAutoRun && !input.multipleStatements) {
     return {
       decision: "allow",

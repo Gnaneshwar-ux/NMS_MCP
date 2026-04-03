@@ -30,6 +30,7 @@ import {
 } from "./db-session.js";
 import {
   executeCommand,
+  getVisibleInteractionBuffers,
   handleShellData,
   interruptSession,
   startInteractiveCommand,
@@ -1038,11 +1039,11 @@ function buildInteractionState(
   stripAnsi = true,
 ): Record<string, unknown> {
   const activeCommand = session.activeCommand;
-  const sourceBuffer = activeCommand ? activeCommand.buffer : session.buffer;
+  const { outputBuffer, promptBuffer } = getVisibleInteractionBuffers(session);
   const output = activeCommand
-    ? cleanCommandOutput(sourceBuffer, activeCommand.submittedCommand, stripAnsi)
-    : cleanShellOutput(sourceBuffer, stripAnsi);
-  const prompt = analyzeInteractionPrompt(sourceBuffer, {
+    ? cleanCommandOutput(outputBuffer, activeCommand.submittedCommand, stripAnsi)
+    : cleanShellOutput(outputBuffer, stripAnsi);
+  const prompt = analyzeInteractionPrompt(promptBuffer, {
     commandHint: activeCommand?.command,
     sessionReady: session.ready,
   });
@@ -1092,7 +1093,7 @@ function buildInteractionState(
     autoResponseSent,
     suggestedInputs,
     output,
-    bufferLength: sourceBuffer.length,
+    bufferLength: outputBuffer.length,
     sessionReady: session.ready,
     isSudo: session.isSudo,
     sessionIdentity: {

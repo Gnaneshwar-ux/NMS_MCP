@@ -36,6 +36,7 @@ test("session manager adds, audits, clears, and closes sessions", () => {
     const { session } = createFakeSession({
       id: "session-a",
       buffer: "stale",
+      recentBuffer: "fresh",
       activeCommand: createActiveCommand(),
     });
 
@@ -46,6 +47,7 @@ test("session manager adds, audits, clears, and closes sessions", () => {
 
     manager.clearBuffer(session, true);
     assert.equal(session.buffer, "");
+    assert.equal(session.recentBuffer, "");
     assert.equal(session.activeCommand?.buffer, "");
 
     const closedSession = manager.close("session-a", "unit test close");

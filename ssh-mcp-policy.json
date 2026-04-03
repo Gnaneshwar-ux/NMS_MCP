@@ -1,12 +1,42 @@
 {
-  "blockedCategories": [],
+  "blockedCategories": [
+    "privilege-escalation",
+    "password-change",
+    "sudoers-change",
+    "account-change",
+    "service-change",
+    "data-delete",
+    "package-remove",
+    "package-install",
+    "database-destructive",
+    "deploy-change",
+    "container-delete",
+    "git-destructive"
+  ],
   "approvalCategories": [
-    "session-state"
+    "session-state",
+    "privileged-command",
+    "shell-wrapper",
+    "interactive-terminal",
+    "file-write",
+    "scratch-write",
+    "opaque-script"
+  ],
+  "approvedScratchPaths": [
+    "/tmp",
+    "/var/tmp"
+  ],
+  "diagnosticsProfiles": [
+    "oracle-nms-readonly"
   ],
   "allowRules": [],
   "denyRules": [],
   "sqlPolicy": {
-    "blockedCategories": [],
+    "blockedCategories": [
+      "ddl-destructive",
+      "db-admin",
+      "lock-control"
+    ],
     "approvalCategories": [
       "session-state"
     ],

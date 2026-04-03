@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { createFakeSession } from "./helpers.js";
-import { handleShellData } from "../dist/executor.js";
+import { getVisibleInteractionBuffers, handleShellData } from "../dist/executor.js";
 
 test("clears a timed-out active command when the shell prompt is already back", () => {
   const { session } = createFakeSession({
@@ -61,4 +61,16 @@ test("does not clear a timed-out active command from a stale prompt marker", () 
   assert.equal(session.ready, false);
   assert.equal(session.manualMode, false);
   assert.equal(session.identity.promptMarkerActive, false);
+});
+
+test("prefers the fresh session buffer for one-shot output while keeping prompt state from the rolling buffer", () => {
+  const { session } = createFakeSession({
+    buffer: "older output\n__MCP_PROMPT__ ",
+    recentBuffer: "fresh output only\n__MCP_PROMPT__ ",
+  });
+
+  const buffers = getVisibleInteractionBuffers(session);
+
+  assert.equal(buffers.outputBuffer, "fresh output only\n__MCP_PROMPT__ ");
+  assert.equal(buffers.promptBuffer, "fresh output only\n__MCP_PROMPT__ ");
 });

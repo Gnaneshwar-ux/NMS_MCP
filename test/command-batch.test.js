@@ -6,18 +6,35 @@ import { summarizeCommandBatchReviews } from "../dist/command-batch.js";
 
 const TEST_POLICY = {
   loadedFrom: null,
-  blockedCategories: [],
-  approvalCategories: ["session-state"],
+  blockedCategories: [
+    "privilege-escalation",
+    "password-change",
+    "sudoers-change",
+    "account-change",
+    "service-change",
+    "data-delete",
+  ],
+  approvalCategories: [
+    "session-state",
+    "privileged-command",
+    "shell-wrapper",
+    "interactive-terminal",
+    "file-write",
+    "scratch-write",
+    "opaque-script",
+  ],
   allowRules: [],
   denyRules: [],
+  approvedScratchPaths: ["/tmp", "/var/tmp"],
+  diagnosticsProfiles: ["oracle-nms-readonly"],
 };
 
 test("allows a read-only standalone command batch", () => {
   const batch = summarizeCommandBatchReviews(
     [
-      "sudo -u esb8 smsReport 2>&1 | head -n 40",
-      "sudo -u esb8 grep -i -n ERROR ~/logs/DDService.log | head -n 20",
-      "sudo -u esb8 find ~/logs -maxdepth 1 -type f | sort | tail -n 10",
+      "hostname",
+      "grep -i -n ERROR ~/logs/DDService.log | head -n 20",
+      "find ~/logs -maxdepth 1 -type f | sort | tail -n 10",
     ],
     undefined,
     TEST_POLICY,
@@ -33,8 +50,8 @@ test("allows a read-only standalone command batch", () => {
 test("requires one shared confirmation when any batch command needs approval", () => {
   const batch = summarizeCommandBatchReviews(
     [
-      "ps -ef | grep weblogic | head -n 20",
-      "systemctl status nms",
+      "sudo -u esb8 whoami",
+      "grep -i -n ERROR ~/logs/DDService.log | head -n 20",
     ],
     undefined,
     TEST_POLICY,

@@ -1,7 +1,17 @@
 import { promises as fs } from "node:fs";
 import process from "node:process";
 
-import { Client, type ClientChannel, type ConnectConfig } from "ssh2";
+import {
+  Client,
+  type Algorithms,
+  type CipherAlgorithm,
+  type ClientChannel,
+  type CompressionAlgorithm,
+  type ConnectConfig,
+  type KexAlgorithm,
+  type MacAlgorithm,
+  type ServerHostKeyAlgorithm,
+} from "ssh2";
 import { v4 as uuidv4 } from "uuid";
 
 import { handleShellData } from "./executor.js";
@@ -22,6 +32,52 @@ import {
 } from "./utils.js";
 
 export type AuthMethod = "password" | "privateKey" | "agent";
+
+const COMPAT_CIPHERS: CipherAlgorithm[] = [
+  "aes128-ctr",
+  "aes192-ctr",
+  "aes256-ctr",
+  "aes128-gcm",
+  "aes128-gcm@openssh.com",
+  "aes256-gcm",
+  "aes256-gcm@openssh.com",
+];
+
+const COMPAT_HMACS: MacAlgorithm[] = [
+  "hmac-sha2-256",
+  "hmac-sha2-512",
+  "hmac-sha2-256-etm@openssh.com",
+  "hmac-sha2-512-etm@openssh.com",
+  "hmac-sha1",
+];
+
+const COMPAT_KEX: KexAlgorithm[] = [
+  "curve25519-sha256",
+  "curve25519-sha256@libssh.org",
+  "ecdh-sha2-nistp256",
+  "ecdh-sha2-nistp384",
+  "ecdh-sha2-nistp521",
+  "diffie-hellman-group14-sha256",
+  "diffie-hellman-group16-sha512",
+  "diffie-hellman-group18-sha512",
+  "diffie-hellman-group-exchange-sha256",
+];
+
+const COMPAT_HOST_KEYS: ServerHostKeyAlgorithm[] = [
+  "ssh-ed25519",
+  "ecdsa-sha2-nistp256",
+  "rsa-sha2-256",
+  "rsa-sha2-512",
+  "ssh-rsa",
+];
+
+const COMPAT_COMPRESSION: CompressionAlgorithm[] = [
+  "none",
+  "zlib@openssh.com",
+  "zlib",
+];
+
+type AlgorithmProfile = "compat" | "default";
 
 interface ConnectShellOptions {
   host: string;
@@ -51,7 +107,7 @@ function normalizeConnectError(error: unknown): Error {
 
   if (
     errorLevel === "client-authentication" ||
-    /all configured authentication methods failed|authentication failed|permission denied/i.test(
+    /all configured authentication methods failed|authentication failed|permission denied|failed to retrieve identities from agent/i.test(
       message,
     )
   ) {
@@ -59,6 +115,29 @@ function normalizeConnectError(error: unknown): Error {
   }
 
   return error instanceof Error ? error : new Error(message);
+}
+
+export function resolveClientAlgorithms(profile = process.env.MCP_SSH_ALGORITHM_PROFILE?.trim().toLowerCase() ?? "compat"): Algorithms | undefined {
+  switch (profile) {
+    case "":
+    case "compat":
+      // Prefer CTR + SHA-2 MACs first because that combination has been the
+      // most reliable over flaky VPN/private routes in our NMS environments.
+      return {
+        cipher: COMPAT_CIPHERS,
+        hmac: COMPAT_HMACS,
+        kex: COMPAT_KEX,
+        serverHostKey: COMPAT_HOST_KEYS,
+        compress: COMPAT_COMPRESSION,
+      };
+    case "default":
+      return undefined;
+    default:
+      throw new HandledError(
+        "INVALID_ARGUMENT",
+        `Unsupported MCP_SSH_ALGORITHM_PROFILE "${profile}". Use "compat" or "default".`,
+      );
+  }
 }
 
 async function resolvePrivateKey(privateKey?: string): Promise<string | Buffer | undefined> {
@@ -79,6 +158,7 @@ async function resolvePrivateKey(privateKey?: string): Promise<string | Buffer |
 }
 
 async function buildConnectConfig(options: ConnectShellOptions): Promise<ConnectConfig> {
+  const algorithms = resolveClientAlgorithms();
   const config: ConnectConfig = {
     host: options.host,
     port: options.port,
@@ -86,6 +166,7 @@ async function buildConnectConfig(options: ConnectShellOptions): Promise<Connect
     readyTimeout: options.connectTimeout,
     keepaliveInterval: 10_000,
     keepaliveCountMax: 3,
+    ...(algorithms ? { algorithms } : {}),
   };
 
   switch (options.authMethod) {
@@ -142,6 +223,9 @@ async function connectClient(options: ConnectShellOptions): Promise<{ client: Cl
 
   return await new Promise((resolve, reject) => {
     const client = new Client();
+    // ssh2 can emit a late auth error after the setup listeners are cleaned up.
+    // Keep a baseline listener attached so the process does not crash.
+    client.on("error", () => {});
     let serverBanner: string | undefined;
     let settled = false;
 

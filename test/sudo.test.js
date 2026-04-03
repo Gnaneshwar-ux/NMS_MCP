@@ -35,6 +35,14 @@ test("infers root shell transitions for plain sudo -i", () => {
   assert.equal(transition.privilegeMode, "root");
 });
 
+test("does not infer shell adoption for one-shot sudo bash -lc commands", () => {
+  const transition = inferShellIdentityTransition(
+    "sudo -iu oracle bash -lc 'whoami'",
+  );
+
+  assert.equal(transition, null);
+});
+
 test("tracks shell identity on exit back to the login user", () => {
   const { session } = createFakeSession({
     username: "test",
@@ -46,6 +54,17 @@ test("tracks shell identity on exit back to the login user", () => {
   assert.equal(session.isSudo, true);
 
   updateSessionSudoState(session, "exit", 0);
+  assert.equal(session.identity.effectiveUser, "test");
+  assert.equal(session.identity.privilegeMode, "standard");
+  assert.equal(session.isSudo, false);
+});
+
+test("does not switch session identity for one-shot sudo shell commands", () => {
+  const { session } = createFakeSession({
+    username: "test",
+  });
+
+  updateSessionSudoState(session, "sudo -iu oracle bash -lc 'whoami'", 0);
   assert.equal(session.identity.effectiveUser, "test");
   assert.equal(session.identity.privilegeMode, "standard");
   assert.equal(session.isSudo, false);
@@ -101,4 +120,17 @@ test("keeps shell-elevating sudo flows on prompt injection", () => {
 
   assert.equal(result.usesPromptInjection, true);
   assert.equal(result.rewrittenCommand, "sudo -iu oracle");
+});
+
+test("rewrites one-shot sudo bash -lc commands to use sudo -S", () => {
+  const result = rewriteSudoCommandWithPassword(
+    "sudo -iu oracle bash -lc 'whoami'",
+    "Oracle1234",
+  );
+
+  assert.equal(result.usesPromptInjection, false);
+  assert.match(
+    result.rewrittenCommand,
+    /^cat <<'__MCP_SUDO_PASSWORD__' \| sudo -S -p '' -iu oracle bash -lc 'whoami'\nOracle1234\n__MCP_SUDO_PASSWORD__$/,
+  );
 });

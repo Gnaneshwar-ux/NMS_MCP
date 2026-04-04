@@ -47,7 +47,7 @@ test("allows a read-only standalone command batch", () => {
   assert.equal(batch.commandCount, 3);
 });
 
-test("requires one shared confirmation when any batch command needs approval", () => {
+test("allows exact sudo read-only target-user checks in a batch", () => {
   const batch = summarizeCommandBatchReviews(
     [
       "sudo -u esb8 whoami",
@@ -57,9 +57,9 @@ test("requires one shared confirmation when any batch command needs approval", (
     TEST_POLICY,
   );
 
-  assert.equal(batch.decision, "approval_required");
-  assert.equal(batch.requiresConfirmation, true);
-  assert.equal(batch.approvalRequiredCount, 1);
+  assert.equal(batch.decision, "allow");
+  assert.equal(batch.requiresConfirmation, false);
+  assert.equal(batch.approvalRequiredCount, 0);
   assert.equal(batch.blockedCount, 0);
 });
 

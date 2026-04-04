@@ -33,7 +33,7 @@ const TOOL_GUIDANCE: UsageGuideToolInfo[] = [
     tool: "ssh_connect",
     useWhen: "Open an SSH session for host diagnostics or command execution.",
     notes: [
-      "Pass plain user fields such as username, hostUser, or ldapUser.",
+      "Pass LDAP-style login fields such as username, hostUser, or ldapUser for the initial SSH session.",
       "Pass encoded secret fields when available; MCP decodes them internally.",
     ],
   },
@@ -116,7 +116,10 @@ const USAGE_GUIDE: UsageGuide = {
     "Never self-confirm.",
   ],
   sudoStyle: [
+    "For NMS-style access, prefer LDAP login first and then sudo to the target project or admin user instead of attempting direct target-user login.",
+    "Exact target-user handoffs such as sudo su - esb8 or sudo -iu oracle can be started with start_interactive_command without an extra CONFIRM prompt.",
     "Prefer direct target-user commands such as sudo -u esb8 smsReport or sudo -u esb8 grep ...",
+    "Exact read-only target-user diagnostics such as sudo -u esb8 whoami, ps, grep, find, or smsReport previews can auto-run without extra confirmation.",
     "Do not add source ~/.bashrc, source ~/.profile, or similar setup after sudo unless the command truly depends on extra environment initialization.",
     "Use interactive sudo flows only when a direct one-shot sudo command is not enough.",
   ],

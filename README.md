@@ -168,7 +168,9 @@ Notes:
 
 - `cd` is treated as low-impact and allowed because it only changes the active shell directory
 - Exact Oracle NMS read-only diagnostics such as `hostname`, `whoami`, `id`, `getent`, `grep -n ... | head`, `ps -ef | grep ... | grep -v grep`, `find ... | sort | tail`, `ss -ltn`, and exact `.nmsrc` validation bundles can auto-run when they match the built-in diagnostics profile
-- Any command containing `sudo` is higher scrutiny and requires confirmation at minimum; shell-elevating privilege changes can be blocked entirely by policy
+- Exact LDAP-style target-user handoffs such as `sudo su - <target-user>` or `sudo -iu <target-user>` can auto-run so MCP can adopt the target shell without an extra confirmation step
+- Exact read-only target-user diagnostics such as `sudo -u <target-user> whoami`, `ps`, `grep`, `find`, or `smsReport 2>&1 | head -n ...` can auto-run when the underlying command already matches the safe diagnostics rules
+- Other `sudo` usage is still higher scrutiny and can require confirmation or be blocked by policy
 - Prefer plain read-only diagnostics or exact `.nmsrc` wrappers over privilege-changing bundles whenever possible
 - After switching to or adopting a target user shell, do not source `.bashrc`, `.profile`, or similar login files unless the command truly depends on extra environment setup
 - Commands that start interactive terminal programs such as `python`, `sqlplus`, `ISQL`, `tail -f`, `less`, `top`, or `ssh` are not treated as safe auto-run commands

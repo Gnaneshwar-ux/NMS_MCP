@@ -1,5 +1,6 @@
 import type { CommandPolicyConfig, PolicyDecision } from "./policy-config.js";
 import type { CommandRiskLevel, ShellSession } from "./session.js";
+import { inferShellIdentityTransition } from "./sudo.js";
 
 export interface MatchedPolicyRule {
   source: "allow" | "deny";
@@ -1126,6 +1127,8 @@ function decideCommandPolicy(
     hasHeredoc: boolean;
     hasWritableRedirection: boolean;
     knownSafeAutoRun: boolean;
+    safeSudoReadOnlyAutoRun: boolean;
+    safePrivilegeTransitionAutoRun: boolean;
   },
   config: CommandPolicyConfig,
   matchedAllowRule?: MatchedPolicyRule,
@@ -1136,6 +1139,8 @@ function decideCommandPolicy(
   matchedRule?: MatchedPolicyRule;
 } {
   const autoAllowPermitted =
+    input.safeSudoReadOnlyAutoRun ||
+    input.safePrivilegeTransitionAutoRun ||
     input.knownSafeAutoRun &&
     !input.usesSudo &&
     !input.elevatesShell &&
@@ -1159,7 +1164,11 @@ function decideCommandPolicy(
   }
 
   if (matchedAllowRule) {
-    if (input.riskLevel === "read-only" && matchedAllowRule.decision === "allow" && autoAllowPermitted) {
+    if (
+      (input.riskLevel === "read-only" || input.safePrivilegeTransitionAutoRun) &&
+      matchedAllowRule.decision === "allow" &&
+      autoAllowPermitted
+    ) {
       return {
         decision: "allow",
         decisionReason: matchedAllowRule.reason,
@@ -1177,7 +1186,11 @@ function decideCommandPolicy(
     };
   }
 
-  if (config.approvalCategories.includes(input.category)) {
+  if (
+    !input.safeSudoReadOnlyAutoRun &&
+    !input.safePrivilegeTransitionAutoRun &&
+    config.approvalCategories.includes(input.category)
+  ) {
     return {
       decision: "approval_required",
       decisionReason: "Active policy requires confirmation for this command category before MCP can run it.",
@@ -1217,6 +1230,34 @@ export function reviewCommandPolicy(
 
   const destructiveMatches = matchRules(textsForRules, DESTRUCTIVE_RULES);
   const mutatingMatches = matchRules(textsForRules, MUTATING_RULES);
+  const readOnlySummary = buildReadOnlySummary(normalizedCommand, config);
+  const leadingPrivilegeWrapper = parseLeadingPrivilegeWrapper(
+    stripLeadingEnvAssignments(normalizedCommand),
+  );
+  const sudoReadOnlySummary =
+    leadingPrivilegeWrapper.usesSudo && !leadingPrivilegeWrapper.elevatesShell
+      ? buildReadOnlySummary(leadingPrivilegeWrapper.analysisTarget, config)
+      : undefined;
+  const privilegeTransition = inferShellIdentityTransition(normalizedCommand);
+  const safePrivilegeTransitionAutoRun =
+    Boolean(privilegeTransition?.viaSudo) &&
+    !inspection.hasPipeline &&
+    !inspection.hasShellWrapper &&
+    !inspection.hasOpaqueInlineScript &&
+    !inspection.hasHeredoc &&
+    !inspection.hasWritableRedirection &&
+    !inspection.hasCommandSubstitution &&
+    !inspection.interactiveCommand;
+  const safeSudoReadOnlyAutoRun =
+    inspection.usesSudo &&
+    !inspection.elevatesShell &&
+    Boolean(sudoReadOnlySummary?.knownSafeAutoRun) &&
+    !inspection.hasShellWrapper &&
+    !inspection.hasOpaqueInlineScript &&
+    !inspection.hasHeredoc &&
+    !inspection.hasWritableRedirection &&
+    !inspection.hasCommandSubstitution &&
+    !inspection.interactiveCommand;
 
   for (const match of destructiveMatches) {
     reasons.add(match.reason);
@@ -1227,11 +1268,19 @@ export function reviewCommandPolicy(
   }
 
   if (inspection.usesSudo) {
-    reasons.add("Contains sudo in the effective command path, so MCP must not auto-run it.");
+    reasons.add(
+      safePrivilegeTransitionAutoRun || safeSudoReadOnlyAutoRun
+        ? "Matches an exact built-in sudo pattern that MCP can auto-run for LDAP-to-target-user handoff."
+        : "Contains sudo in the effective command path, so MCP must not auto-run it.",
+    );
   }
 
   if (inspection.elevatesShell) {
-    reasons.add("Changes the active shell identity or privilege boundary.");
+    reasons.add(
+      safePrivilegeTransitionAutoRun && privilegeTransition
+        ? `Adopts the managed shell as ${privilegeTransition.expectedUser}.`
+        : "Changes the active shell identity or privilege boundary.",
+    );
   }
 
   if (inspection.hasPipeline) {
@@ -1266,7 +1315,6 @@ export function reviewCommandPolicy(
     reasons.add("Starts an interactive or long-running terminal program that may require follow-up input.");
   }
 
-  const readOnlySummary = buildReadOnlySummary(normalizedCommand, config);
   let riskLevel: CommandRiskLevel = "read-only";
   let category = readOnlySummary.category;
   let summary = readOnlySummary.summary;
@@ -1277,6 +1325,11 @@ export function reviewCommandPolicy(
     category = destructiveMatches[0]?.category ?? category;
     summary = destructiveMatches[0]?.summary ?? summary;
     knownSafeAutoRun = false;
+  } else if (safePrivilegeTransitionAutoRun && privilegeTransition) {
+    riskLevel = "mutating";
+    category = "privileged-session-switch";
+    summary = `This exact sudo-based shell switch adopts the ${privilegeTransition.expectedUser} user for subsequent commands.`;
+    knownSafeAutoRun = true;
   } else if (
     knownSafeAutoRun &&
     mutatingMatches.every((match) => match.category === "session-state") &&
@@ -1302,8 +1355,10 @@ export function reviewCommandPolicy(
   ) {
     riskLevel = "read-only";
     category = "privileged-command";
-    summary = "This command runs under sudo and therefore still needs explicit review.";
-    knownSafeAutoRun = false;
+    summary = safeSudoReadOnlyAutoRun
+      ? "This exact read-only diagnostic runs under sudo as the requested target user."
+      : "This command runs under sudo and therefore still needs explicit review.";
+    knownSafeAutoRun = safeSudoReadOnlyAutoRun;
   } else if (
     mutatingMatches.length > 0 ||
     inspection.hasWritableRedirection ||
@@ -1355,6 +1410,8 @@ export function reviewCommandPolicy(
       hasHeredoc: inspection.hasHeredoc,
       hasWritableRedirection: inspection.hasWritableRedirection,
       knownSafeAutoRun,
+      safeSudoReadOnlyAutoRun,
+      safePrivilegeTransitionAutoRun,
     },
     config,
     matchedAllowRule,
@@ -1393,7 +1450,7 @@ export function reviewCommandPolicy(
       decisionState.decision !== "allow" ||
       inspection.hasOpaqueInlineScript ||
       inspection.hasHeredoc ||
-      inspection.usesSudo ||
+      (inspection.usesSudo && !safeSudoReadOnlyAutoRun && !safePrivilegeTransitionAutoRun) ||
       inspection.hasWritableRedirection,
     knownSafeAutoRun,
   };

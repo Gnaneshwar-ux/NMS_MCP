@@ -30,16 +30,16 @@ const TEST_POLICY = {
   diagnosticsProfiles: ["oracle-nms-readonly"],
 };
 
-test("requires confirmation for read-only sudo diagnostics", () => {
+test("allows exact read-only sudo diagnostics for target-user execution", () => {
   const review = reviewCommandPolicy(
     "sudo -u esb8 ps -ef | egrep 'isis|JMS' | grep -v grep | head -n 20",
     undefined,
     TEST_POLICY,
   );
 
-  assert.equal(review.decision, "approval_required");
-  assert.equal(review.requiresConfirmation, true);
-  assert.equal(review.safeForAutoRun, false);
+  assert.equal(review.decision, "allow");
+  assert.equal(review.requiresConfirmation, false);
+  assert.equal(review.safeForAutoRun, true);
   assert.equal(review.category, "privileged-command");
   assert.equal(review.riskLevel, "read-only");
 });
@@ -57,11 +57,23 @@ test("allows exact read-only diagnostics bundles wrapped in bash -lc", () => {
   assert.equal(review.category, "diagnostic-bundle");
 });
 
-test("blocks shell-elevating sudo flows", () => {
+test("allows exact sudo-based shell adoption flows", () => {
   const review = reviewCommandPolicy("sudo -iu oracle", undefined, TEST_POLICY);
 
-  assert.equal(review.decision, "blocked");
-  assert.equal(review.category, "privilege-escalation");
+  assert.equal(review.decision, "allow");
+  assert.equal(review.requiresConfirmation, false);
+  assert.equal(review.safeForAutoRun, true);
+  assert.equal(review.category, "privileged-session-switch");
+  assert.equal(review.riskLevel, "mutating");
+});
+
+test("allows sudo su target-user handoff flows", () => {
+  const review = reviewCommandPolicy("sudo su - nmsadmin", undefined, TEST_POLICY);
+
+  assert.equal(review.decision, "allow");
+  assert.equal(review.requiresConfirmation, false);
+  assert.equal(review.safeForAutoRun, true);
+  assert.equal(review.category, "privileged-session-switch");
 });
 
 test("allows known-safe read-only commands inside an already elevated session", () => {

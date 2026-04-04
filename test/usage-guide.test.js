@@ -11,6 +11,8 @@ test("usage guide exposes preferred style and tool guidance", () => {
   assert.ok(guide.preferredStyle.some((entry) => entry.includes("standalone")));
   assert.ok(guide.confirmationStyle.some((entry) => entry.includes("one shared confirmation")));
   assert.ok(guide.sudoStyle.some((entry) => entry.includes("sudo -u")));
+  assert.ok(guide.sudoStyle.some((entry) => entry.includes("LDAP login first")));
+  assert.ok(guide.sudoStyle.some((entry) => entry.includes("sudo su -")));
   assert.equal(guide.livePolicyReference.tool, "read_policy");
 
   const toolNames = new Set(guide.toolGuidance.map((entry) => entry.tool));

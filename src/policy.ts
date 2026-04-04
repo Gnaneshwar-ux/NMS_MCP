@@ -101,6 +101,7 @@ const SAFE_DIRECT_SEGMENT_PATTERNS: Array<{
   { regex: /^ss\s+-ltn$/i, category: "network-read", summary: "Exact listening TCP socket diagnostic." },
   { regex: /^head(?:\s+-n\s+\d+)?\s+.+$/i, category: "log-read", summary: "Exact head file preview." },
   { regex: /^tail\s+-n\s+\d+\s+.+$/i, category: "log-read", summary: "Exact tail file preview." },
+  { regex: /^smsReport(?:\s+2>&1)?$/i, category: "server-state", summary: "Exact smsReport diagnostic." },
   { regex: /^smsReport(?:\s+2>&1)?\s*\|\s*head\s+-n\s+\d+$/i, category: "server-state", summary: "Exact smsReport preview pipeline." },
   {
     regex:
@@ -216,7 +217,7 @@ const MUTATING_RULES: MatchRule[] = [
     summary: "This command can change service or process availability.",
     reason: "Matches service control actions such as start, stop, restart, or kill.",
     regex:
-      /(?:systemctl|service)\s+[^\n]*(?:start|stop|restart|reload|enable|disable|mask|unmask)\b|\b(?:kill|pkill|killall)\b/i,
+      /(?:systemctl|service)\s+[^\n]*(?:start|stop|restart|reload|enable|disable|mask|unmask)\b|\b(?:kill|pkill|killall)\b|(?:^|[;&|]\s*)(?:sms-(?:start|stop)\b|nms-all-(?:start|stop)\b|nms-wls-control\b)/i,
   },
   {
     riskLevel: "mutating",
@@ -1241,6 +1242,7 @@ export function reviewCommandPolicy(
   const privilegeTransition = inferShellIdentityTransition(normalizedCommand);
   const safePrivilegeTransitionAutoRun =
     Boolean(privilegeTransition?.viaSudo) &&
+    privilegeTransition?.expectedUser !== "root" &&
     !inspection.hasPipeline &&
     !inspection.hasShellWrapper &&
     !inspection.hasOpaqueInlineScript &&

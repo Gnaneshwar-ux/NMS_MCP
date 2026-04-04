@@ -2,7 +2,10 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { createFakeSession } from "./helpers.js";
-import { summarizeCommandBatchReviews } from "../dist/command-batch.js";
+import {
+  shouldStopBatchOnExitCode,
+  summarizeCommandBatchReviews,
+} from "../dist/command-batch.js";
 
 const TEST_POLICY = {
   loadedFrom: null,
@@ -109,4 +112,10 @@ test("allows already-elevated sessions to batch known-safe read-only checks", ()
   assert.equal(batch.decision, "allow");
   assert.equal(batch.requiresConfirmation, false);
   assert.equal(batch.safeForAutoRun, true);
+});
+
+test("stopOnError treats non-zero exit codes as a batch stop signal", () => {
+  assert.equal(shouldStopBatchOnExitCode(1, true), true);
+  assert.equal(shouldStopBatchOnExitCode(0, true), false);
+  assert.equal(shouldStopBatchOnExitCode(2, false), false);
 });

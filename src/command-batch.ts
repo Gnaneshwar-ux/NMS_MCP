@@ -18,6 +18,13 @@ export interface CommandBatchReview {
 
 const BATCH_SEPARATOR = "\n--MCP-COMMAND-BATCH--\n";
 
+export function shouldStopBatchOnExitCode(
+  exitCode: number,
+  stopOnError: boolean,
+): boolean {
+  return stopOnError && exitCode !== 0;
+}
+
 function pickHighestRiskLevel(reviews: CommandReview[]): CommandRiskLevel {
   if (reviews.some((review) => review.riskLevel === "destructive")) {
     return "destructive";

@@ -57,7 +57,7 @@ test("allows exact read-only diagnostics bundles wrapped in bash -lc", () => {
   assert.equal(review.category, "diagnostic-bundle");
 });
 
-test("allows exact sudo-based shell adoption flows", () => {
+test("allows exact non-root sudo-based shell adoption flows", () => {
   const review = reviewCommandPolicy("sudo -iu oracle", undefined, TEST_POLICY);
 
   assert.equal(review.decision, "allow");
@@ -74,6 +74,42 @@ test("allows sudo su target-user handoff flows", () => {
   assert.equal(review.requiresConfirmation, false);
   assert.equal(review.safeForAutoRun, true);
   assert.equal(review.category, "privileged-session-switch");
+});
+
+test("blocks root sudo handoff flows from auto-running", () => {
+  const review = reviewCommandPolicy("sudo su - root", undefined, TEST_POLICY);
+
+  assert.equal(review.decision, "blocked");
+  assert.equal(review.requiresConfirmation, false);
+  assert.equal(review.safeForAutoRun, false);
+  assert.equal(review.category, "privilege-escalation");
+});
+
+test("blocks implicit root login-shell sudo flows from auto-running", () => {
+  const review = reviewCommandPolicy("sudo -i", undefined, TEST_POLICY);
+
+  assert.equal(review.decision, "blocked");
+  assert.equal(review.requiresConfirmation, false);
+  assert.equal(review.safeForAutoRun, false);
+  assert.equal(review.category, "privilege-escalation");
+});
+
+test("blocks NMS service control commands as service changes", () => {
+  const review = reviewCommandPolicy("sms-stop -ais", undefined, TEST_POLICY);
+
+  assert.equal(review.decision, "blocked");
+  assert.equal(review.category, "service-change");
+  assert.equal(review.riskLevel, "mutating");
+});
+
+test("allows bare smsReport as an exact read-only NMS diagnostic", () => {
+  const review = reviewCommandPolicy("smsReport", undefined, TEST_POLICY);
+
+  assert.equal(review.decision, "allow");
+  assert.equal(review.requiresConfirmation, false);
+  assert.equal(review.safeForAutoRun, true);
+  assert.equal(review.category, "server-state");
+  assert.equal(review.riskLevel, "read-only");
 });
 
 test("allows known-safe read-only commands inside an already elevated session", () => {

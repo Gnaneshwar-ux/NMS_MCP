@@ -57,7 +57,7 @@ Oracle DB:
 - `MCP_DB_DEFAULT_TIMEOUT_MS` default `30000`
 - `MCP_DB_MAX_SESSIONS` default `5`
 - `MCP_DB_MAX_ROWS` default `200`
-- `MCP_DB_CONFIG_DIR` optional Oracle Net config directory for wallet or TNS-based connections
+- `MCP_DB_CONFIG_DIR` optional Oracle Net config directory for wallet or TNS-based connections; if unset, MCP also falls back to `TNS_ADMIN` when present
 - `MCP_DB_WALLET_LOCATION` optional wallet directory
 - `MCP_DB_WALLET_PASSWORD` optional wallet password
 - `MCP_DB_HTTPS_PROXY` optional HTTPS proxy for secure Oracle DB connections

@@ -10,7 +10,10 @@ import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 
-import { summarizeCommandBatchReviews } from "./command-batch.js";
+import {
+  shouldStopBatchOnExitCode,
+  summarizeCommandBatchReviews,
+} from "./command-batch.js";
 import {
   closeBrokenOracleSession,
   closeOracleSession,
@@ -1855,6 +1858,9 @@ async function callExecuteCommandBatch(
   return await runExclusiveShellOperation(session, "execute_command_batch", async () => {
     const policy = ensureCommandBatchApproval(session, commands, approvalId, userConfirmation);
     const results: Array<Record<string, unknown>> = [];
+    let stoppedEarly = false;
+    let stopReason: string | null = null;
+    let stoppedAfterIndex: number | null = null;
 
     sessionManager.recordAudit({
       level: "info",
@@ -1932,6 +1938,33 @@ async function callExecuteCommandBatch(
           },
           interaction: buildInteractionState(session, stripAnsi),
         });
+
+        if (shouldStopBatchOnExitCode(result.exitCode, stopOnError)) {
+          stoppedEarly = true;
+          stopReason = "non_zero_exit_code";
+          stoppedAfterIndex = index;
+
+          sessionManager.recordAudit({
+            level: "warning",
+            event: "command_failed",
+            message: `Stopped batch execution after command ${index + 1} of ${commands.length} returned exit code ${result.exitCode}.`,
+            sessionId: session.id,
+            host: session.host,
+            username: session.username,
+            command,
+            riskLevel: commandPolicy?.riskLevel ?? policy.riskLevel,
+            details: {
+              category: commandPolicy?.category ?? policy.category,
+              executionMode: "batch",
+              batchIndex: index + 1,
+              batchSize: commands.length,
+              stopOnError,
+              stopReason,
+              exitCode: result.exitCode,
+            },
+          });
+          break;
+        }
       } catch (error) {
         if (error instanceof HandledError) {
           error.details["batchResults"] = results;
@@ -1984,19 +2017,25 @@ async function callExecuteCommandBatch(
       username: session.username,
       command: `batch(${commands.length})`,
       riskLevel: policy.riskLevel,
-      details: {
-        category: policy.category,
-        executionMode: "batch",
-        completedCount: results.length,
-        stopOnError,
-      },
-    });
+        details: {
+          category: policy.category,
+          executionMode: "batch",
+          completedCount: results.length,
+          stopOnError,
+          stoppedEarly,
+          stopReason,
+          stoppedAfterIndex,
+        },
+      });
 
     return {
       executed: true,
       commandCount: commands.length,
       completedCount: results.length,
       stopOnError,
+      stoppedEarly,
+      stopReason,
+      stoppedAfterIndex,
       policy: {
         riskLevel: policy.riskLevel,
         category: policy.category,
@@ -2184,7 +2223,10 @@ async function callOracleConnect(args: Record<string, unknown>): Promise<Record<
   const sid = readString(args, "sid");
   const sessionLabel = readString(args, "sessionLabel");
   const connectTimeout = readPositiveInteger(args, "connectTimeout", 15_000);
-  const configDir = readString(args, "configDir") ?? process.env.MCP_DB_CONFIG_DIR?.trim();
+  const configDir =
+    readString(args, "configDir") ??
+    process.env.MCP_DB_CONFIG_DIR?.trim() ??
+    process.env.TNS_ADMIN?.trim();
   const walletLocation =
     readString(args, "walletLocation") ?? process.env.MCP_DB_WALLET_LOCATION?.trim();
   const walletPassword =

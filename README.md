@@ -10,6 +10,7 @@ Production-grade MCP server for persistent SSH PTY sessions and cached Oracle DB
 - Auto-runs only an explicit safe read-only command list and safe SELECT queries
 - Requires user confirmation for anything outside the explicit safe list
 - Supports custom project and NMS commands, but never runs them blindly when MCP is not confident about the consequences
+- Can browse Oracle Utilities Network Management System documentation versions, download guide PDFs on demand, and return a cached local file path to the agent
 - Writes an audit record for SSH commands, Oracle SQL, hosts, DB targets, approvals, blocks, starts, completions, timeouts, and interrupts to a file on disk
 - Supports MCP stdio by default and optional HTTP + SSE transport
 
@@ -21,6 +22,7 @@ src/
 |-- session.ts
 |-- ssh.ts
 |-- executor.ts
+|-- nms-docs.ts
 |-- sudo.ts
 |-- db.ts
 |-- db-session.ts
@@ -65,6 +67,11 @@ Audit:
 
 - `MCP_AUDIT_LOG_FILE` default `C:\ProjectNMS\NMS_MCP\mcp-audit.ndjson` when running from this repo
 
+Oracle NMS documentation:
+
+- `MCP_NMS_DOCS_BOOKS_URL` default `https://docs.oracle.com/en/industries/energy-water/network-management-system/books.html`
+- `MCP_NMS_DOCS_CACHE_DIR` default `%USERPROFILE%\Documents\nms-docs`
+
 ## Tools
 
 Shell tools:
@@ -90,6 +97,8 @@ Oracle DB tools:
 - `review_sql`
 - `execute_sql`
 - `list_db_sessions`
+- `list_nms_guides`
+- `get_nms_guide_pdf`
 - `close_db_session`
 - `interrupt_db_session`
 
@@ -98,6 +107,11 @@ Shared visibility:
 - `read_usage_guide`
 - `read_policy`
 - `read_audit_log`
+
+Oracle NMS documentation tools:
+
+- `list_nms_guides`
+- `get_nms_guide_pdf`
 
 ## Safety model
 
@@ -219,6 +233,19 @@ Every reviewed or executed operation is appended to the audit file:
 - timestamps and structured details
 
 The default audit file is `mcp-audit.ndjson`. Each line is one JSON object so it is easy to search or archive.
+
+## Oracle NMS documentation access
+
+Use `list_nms_guides` to scrape the live Oracle NMS docs library and discover available versions plus guide titles.
+
+Use `get_nms_guide_pdf` with a version and guide query to resolve one PDF to a local cached file path. If the file is already cached, MCP returns that local path immediately. Otherwise MCP downloads the PDF into the configured cache directory first and then returns the absolute path.
+
+Examples:
+
+- `list_nms_guides` to inspect all currently published versions and guides
+- `list_nms_guides` with `{"version":"25.12"}`
+- `get_nms_guide_pdf` with `{"version":"25.12","guide":"installation guide"}`
+- `get_nms_guide_pdf` with `{"version":"25.12","guide":"nms-installation-guide","refresh":true}`
 
 ## Policy files
 

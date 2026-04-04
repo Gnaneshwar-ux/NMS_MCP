@@ -37,6 +37,10 @@ import {
   waitForCommandActivity,
 } from "./executor.js";
 import {
+  listNmsGuides,
+  resolveNmsGuidePdf,
+} from "./nms-docs.js";
+import {
   loadCommandPolicyConfig,
   loadSqlPolicyConfig,
   summarizeCombinedPolicyConfig,
@@ -380,6 +384,33 @@ const TOOL_DEFINITIONS = [
       type: "object",
       additionalProperties: false,
       properties: {},
+    },
+  },
+  {
+    name: "list_nms_guides",
+    description:
+      "Lists Oracle Utilities Network Management System documentation versions and guides from the live Oracle docs site, including cached local PDF paths when present.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        version: { type: "string" },
+      },
+    },
+  },
+  {
+    name: "get_nms_guide_pdf",
+    description:
+      "Finds one Oracle Utilities Network Management System guide, downloads its PDF into the local cache when needed, and returns the absolute local file path.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["version", "guide"],
+      properties: {
+        version: { type: "string" },
+        guide: { type: "string" },
+        refresh: { type: "boolean", default: false },
+      },
     },
   },
   {
@@ -2410,6 +2441,35 @@ async function callListDbSessions(): Promise<Record<string, unknown>> {
   };
 }
 
+async function callListNmsGuides(
+  args: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  const version = readString(args, "version");
+  const result = await listNmsGuides({
+    versionQuery: version,
+  });
+  return {
+    ...result,
+  };
+}
+
+async function callGetNmsGuidePdf(
+  args: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  const version = readString(args, "version", true) ?? "";
+  const guide = readString(args, "guide", true) ?? "";
+  const refresh = readBoolean(args, "refresh", false);
+
+  const result = await resolveNmsGuidePdf({
+    versionQuery: version,
+    guideQuery: guide,
+    refresh,
+  });
+  return {
+    ...result,
+  };
+}
+
 async function callReadPolicy(): Promise<Record<string, unknown>> {
   return {
     ...summarizeCombinedPolicyConfig(commandPolicyConfig, sqlPolicyConfig),
@@ -2602,6 +2662,10 @@ function buildServer() {
         return await safeToolCall(() => callReviewSql(args));
       case "list_db_sessions":
         return await safeToolCall(() => callListDbSessions());
+      case "list_nms_guides":
+        return await safeToolCall(() => callListNmsGuides(args));
+      case "get_nms_guide_pdf":
+        return await safeToolCall(() => callGetNmsGuidePdf(args));
       case "read_usage_guide":
         return await safeToolCall(() => callReadUsageGuide());
       case "read_policy":

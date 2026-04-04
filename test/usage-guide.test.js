@@ -13,11 +13,14 @@ test("usage guide exposes preferred style and tool guidance", () => {
   assert.ok(guide.sudoStyle.some((entry) => entry.includes("sudo -u")));
   assert.ok(guide.sudoStyle.some((entry) => entry.includes("LDAP login first")));
   assert.ok(guide.sudoStyle.some((entry) => entry.includes("sudo su -")));
+  assert.ok(guide.preferredStyle.some((entry) => entry.includes("list_nms_guides")));
   assert.equal(guide.livePolicyReference.tool, "read_policy");
 
   const toolNames = new Set(guide.toolGuidance.map((entry) => entry.tool));
   assert.ok(toolNames.has("read_usage_guide"));
   assert.ok(toolNames.has("execute_command"));
   assert.ok(toolNames.has("execute_command_batch"));
+  assert.ok(toolNames.has("list_nms_guides"));
+  assert.ok(toolNames.has("get_nms_guide_pdf"));
   assert.ok(toolNames.has("read_policy"));
 });

@@ -92,6 +92,21 @@ const TOOL_GUIDANCE: UsageGuideToolInfo[] = [
     useWhen: "Run read-only SQL after connection, or an approved SQL statement after review/confirmation.",
   },
   {
+    tool: "list_nms_guides",
+    useWhen: "Browse Oracle Utilities Network Management System documentation versions and guide titles from the live Oracle docs site.",
+    notes: [
+      "Use this first when you need the right version, guide title, slug, or cached local PDF path.",
+    ],
+  },
+  {
+    tool: "get_nms_guide_pdf",
+    useWhen: "Resolve one Oracle Utilities Network Management System guide to a cached local PDF path, downloading it when necessary.",
+    notes: [
+      "Pass the NMS version plus a guide title, slug, or PDF filename fragment.",
+      "Prefer this over handing the AI a raw Oracle docs URL.",
+    ],
+  },
+  {
     tool: "read_audit_log",
     useWhen: "You need evidence of what MCP reviewed or executed.",
   },
@@ -104,6 +119,7 @@ const USAGE_GUIDE: UsageGuide = {
     "Prefer standalone read-only commands over one large bundled bash or shell script block.",
     "For related checks on one host, prefer review_command_batch and execute_command_batch.",
     "Keep each command focused on one question so the output is easy to inspect and summarize.",
+    "For Oracle NMS product documentation, prefer list_nms_guides and get_nms_guide_pdf over manual website scraping.",
   ],
   commandStyle: [
     "Good pattern: hostname, whoami, smsReport, ps, grep, find, tail, ss.",

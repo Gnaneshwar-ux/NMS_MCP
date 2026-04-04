@@ -1,6 +1,7 @@
 dist/
 node_modules/
 .codex-ssh/
+cache/
 mcp-audit.ndjson
 smoke-result.json
 .env

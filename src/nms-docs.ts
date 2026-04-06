@@ -1,9 +1,11 @@
+import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { promisify } from "node:util";
 
-import { HandledError } from "./utils.js";
+import { getErrorMessage, HandledError } from "./utils.js";
 
 const DEFAULT_NMS_BOOKS_URL =
   process.env.MCP_NMS_DOCS_BOOKS_URL?.trim() ||
@@ -11,11 +13,15 @@ const DEFAULT_NMS_BOOKS_URL =
 const DEFAULT_NMS_CACHE_DIR =
   process.env.MCP_NMS_DOCS_CACHE_DIR?.trim() ||
   path.resolve(os.homedir(), "Documents", "nms-docs");
+const POWERSHELL_FETCH_TIMEOUT_SECONDS = 90;
+const POWERSHELL_EXEC_TIMEOUT_MS = 120_000;
+const POWERSHELL_MAX_BUFFER_BYTES = 100 * 1024 * 1024;
 
 const VERSION_GUIDES_PATH_PATTERN = /(?:^|\/)(nms_[^/]+?_guides\.html)$/i;
 const GUIDE_JSON_PATTERN =
   /<script\b[^>]*id=["']book-data["'][^>]*>\s*([\s\S]*?)\s*<\/script>/i;
 const LINK_PATTERN = /<a\b[^>]*href=["']([^"'#]+)["'][^>]*>([\s\S]*?)<\/a>/gi;
+const execFileAsync = promisify(execFile);
 
 export interface NmsGuideSummary {
   title: string;
@@ -165,40 +171,185 @@ function chooseFetch(fetchImpl?: typeof fetch): typeof fetch {
   return fetch;
 }
 
-async function fetchText(url: string, fetchImpl?: typeof fetch): Promise<string> {
-  const response = await chooseFetch(fetchImpl)(url, {
-    headers: {
-      accept: "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
-    },
-  });
-
-  if (!response.ok) {
-    throw new HandledError(
-      "DOCS_FETCH_FAILED",
-      `Failed to fetch Oracle NMS documentation index from ${url} (HTTP ${response.status}).`,
-      { url, httpStatus: response.status },
-    );
+function shouldTryPowerShellFallback(error: unknown): boolean {
+  if (process.platform !== "win32") {
+    return false;
   }
 
-  return await response.text();
+  if (error instanceof HandledError) {
+    return false;
+  }
+
+  const root = error as { cause?: unknown };
+  const cause = root?.cause;
+  const details = [
+    getErrorMessage(error),
+    cause && typeof cause === "object" && "message" in cause
+      ? String((cause as { message?: unknown }).message ?? "")
+      : "",
+    cause && typeof cause === "object" && "code" in cause
+      ? String((cause as { code?: unknown }).code ?? "")
+      : "",
+  ]
+    .join(" ")
+    .toLowerCase();
+
+  return (
+    details.includes("fetch failed") ||
+    details.includes("connect timeout") ||
+    details.includes("timed out") ||
+    details.includes("econn") ||
+    details.includes("und_err")
+  );
+}
+
+function escapePowerShellSingleQuoted(value: string): string {
+  return value.replace(/'/g, "''");
+}
+
+async function fetchTextViaPowerShell(url: string): Promise<string> {
+  const script = [
+    "$ProgressPreference='SilentlyContinue';",
+    "$ErrorActionPreference='Stop';",
+    `$response = Invoke-WebRequest -UseBasicParsing -Uri '${escapePowerShellSingleQuoted(url)}' -TimeoutSec ${POWERSHELL_FETCH_TIMEOUT_SECONDS};`,
+    "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8;",
+    "Write-Output $response.Content;",
+  ].join(" ");
+
+  const { stdout } = await execFileAsync(
+    "powershell.exe",
+    [
+      "-NoProfile",
+      "-NonInteractive",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-Command",
+      script,
+    ],
+    {
+      timeout: POWERSHELL_EXEC_TIMEOUT_MS,
+      maxBuffer: POWERSHELL_MAX_BUFFER_BYTES,
+      windowsHide: true,
+    },
+  );
+
+  return stdout;
+}
+
+async function fetchBinaryViaPowerShell(url: string): Promise<Buffer> {
+  const script = [
+    "$ProgressPreference='SilentlyContinue';",
+    "$ErrorActionPreference='Stop';",
+    "$tmp = [System.IO.Path]::GetTempFileName();",
+    "try {",
+    `  Invoke-WebRequest -UseBasicParsing -Uri '${escapePowerShellSingleQuoted(url)}' -OutFile $tmp -TimeoutSec ${POWERSHELL_FETCH_TIMEOUT_SECONDS} | Out-Null;`,
+    "  $bytes = [System.IO.File]::ReadAllBytes($tmp);",
+    "  [Console]::OutputEncoding = [System.Text.Encoding]::UTF8;",
+    "  Write-Output ([Convert]::ToBase64String($bytes));",
+    "} finally {",
+    "  Remove-Item -LiteralPath $tmp -ErrorAction SilentlyContinue;",
+    "}",
+  ].join(" ");
+
+  const { stdout } = await execFileAsync(
+    "powershell.exe",
+    [
+      "-NoProfile",
+      "-NonInteractive",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-Command",
+      script,
+    ],
+    {
+      timeout: POWERSHELL_EXEC_TIMEOUT_MS,
+      maxBuffer: POWERSHELL_MAX_BUFFER_BYTES,
+      windowsHide: true,
+    },
+  );
+
+  const payload = stdout.replace(/\s+/g, "");
+  if (!payload) {
+    throw new Error("PowerShell fetch returned an empty payload.");
+  }
+
+  return Buffer.from(payload, "base64");
+}
+
+async function fetchText(url: string, fetchImpl?: typeof fetch): Promise<string> {
+  try {
+    const response = await chooseFetch(fetchImpl)(url, {
+      headers: {
+        accept: "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
+      },
+    });
+
+    if (!response.ok) {
+      throw new HandledError(
+        "DOCS_FETCH_FAILED",
+        `Failed to fetch Oracle NMS documentation index from ${url} (HTTP ${response.status}).`,
+        { url, httpStatus: response.status },
+      );
+    }
+
+    return await response.text();
+  } catch (error) {
+    if (!fetchImpl && shouldTryPowerShellFallback(error)) {
+      try {
+        return await fetchTextViaPowerShell(url);
+      } catch (fallbackError) {
+        throw new HandledError(
+          "DOCS_FETCH_FAILED",
+          `Failed to fetch Oracle NMS documentation index from ${url}.`,
+          {
+            url,
+            fetchError: getErrorMessage(error),
+            fallbackError: getErrorMessage(fallbackError),
+          },
+        );
+      }
+    }
+
+    throw error;
+  }
 }
 
 async function fetchBinary(url: string, fetchImpl?: typeof fetch): Promise<Buffer> {
-  const response = await chooseFetch(fetchImpl)(url, {
-    headers: {
-      accept: "application/pdf,application/octet-stream;q=0.9,*/*;q=0.8",
-    },
-  });
+  try {
+    const response = await chooseFetch(fetchImpl)(url, {
+      headers: {
+        accept: "application/pdf,application/octet-stream;q=0.9,*/*;q=0.8",
+      },
+    });
 
-  if (!response.ok) {
-    throw new HandledError(
-      "DOCS_FETCH_FAILED",
-      `Failed to download Oracle NMS PDF from ${url} (HTTP ${response.status}).`,
-      { url, httpStatus: response.status },
-    );
+    if (!response.ok) {
+      throw new HandledError(
+        "DOCS_FETCH_FAILED",
+        `Failed to download Oracle NMS PDF from ${url} (HTTP ${response.status}).`,
+        { url, httpStatus: response.status },
+      );
+    }
+
+    return Buffer.from(await response.arrayBuffer());
+  } catch (error) {
+    if (!fetchImpl && shouldTryPowerShellFallback(error)) {
+      try {
+        return await fetchBinaryViaPowerShell(url);
+      } catch (fallbackError) {
+        throw new HandledError(
+          "DOCS_FETCH_FAILED",
+          `Failed to download Oracle NMS PDF from ${url}.`,
+          {
+            url,
+            fetchError: getErrorMessage(error),
+            fallbackError: getErrorMessage(fallbackError),
+          },
+        );
+      }
+    }
+
+    throw error;
   }
-
-  return Buffer.from(await response.arrayBuffer());
 }
 
 function parseVersionLinks(html: string, booksUrl: string): VersionLink[] {

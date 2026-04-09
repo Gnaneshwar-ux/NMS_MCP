@@ -38,6 +38,15 @@ const TOOL_GUIDANCE: UsageGuideToolInfo[] = [
     ],
   },
   {
+    tool: "ssh_connect_target_session",
+    useWhen:
+      "Open an SSH session and immediately adopt a non-root target user so later diagnostics do not have to repeat sudo.",
+    notes: [
+      "Prefer this for NMS log analysis when you know the project or admin target user up front.",
+      "Use targetSwitchMethod to choose between sudo su - <user> and sudo -iu <user>.",
+    ],
+  },
+  {
     tool: "review_command",
     useWhen: "You want one command reviewed before deciding whether to run it.",
     avoidWhen: "You already know you need a related multi-command check on the same host.",
@@ -82,6 +91,9 @@ const TOOL_GUIDANCE: UsageGuideToolInfo[] = [
   {
     tool: "oracle_connect",
     useWhen: "Open an Oracle DB session for read-only diagnostics or approved SQL execution.",
+    notes: [
+      "Prefer the read-only application schema first unless the user explicitly needs a higher-privilege account.",
+    ],
   },
   {
     tool: "review_sql",
@@ -90,6 +102,9 @@ const TOOL_GUIDANCE: UsageGuideToolInfo[] = [
   {
     tool: "execute_sql",
     useWhen: "Run read-only SQL after connection, or an approved SQL statement after review/confirmation.",
+    notes: [
+      "Prefer one exact SELECT statement at a time instead of multi-statement SQL blocks.",
+    ],
   },
   {
     tool: "list_nms_guides",
@@ -118,6 +133,7 @@ const USAGE_GUIDE: UsageGuide = {
   preferredStyle: [
     "Prefer standalone read-only commands over one large bundled bash or shell script block.",
     "For related checks on one host, prefer review_command_batch and execute_command_batch.",
+    "When repeated checks should run as one project or admin user, prefer ssh_connect_target_session over repeating sudo on every command.",
     "Keep each command focused on one question so the output is easy to inspect and summarize.",
     "For Oracle NMS product documentation, prefer list_nms_guides and get_nms_guide_pdf over manual website scraping.",
   ],
@@ -125,6 +141,7 @@ const USAGE_GUIDE: UsageGuide = {
     "Good pattern: hostname, whoami, smsReport, ps, grep, find, tail, ss.",
     "Prefer grep -n, head, tail, sort, and narrow find filters so the output stays readable.",
     "Avoid giant quoted bash -lc bundles unless the command truly requires a one-shot shell wrapper.",
+    "For SQL, prefer one exact read-only statement at a time instead of multi-statement blocks.",
   ],
   confirmationStyle: [
     "Do not ask for confirmation repeatedly when one shared confirmation for a related command batch is enough.",
@@ -133,6 +150,7 @@ const USAGE_GUIDE: UsageGuide = {
   ],
   sudoStyle: [
     "For NMS-style access, prefer LDAP login first and then sudo to the target project or admin user instead of attempting direct target-user login.",
+    "When you already know the target account, prefer ssh_connect_target_session so later checks can run directly as that user.",
     "Exact target-user handoffs such as sudo su - esb8 or sudo -iu oracle can be started with start_interactive_command without an extra CONFIRM prompt.",
     "Prefer direct target-user commands such as sudo -u esb8 smsReport or sudo -u esb8 grep ...",
     "Exact read-only target-user diagnostics such as sudo -u esb8 whoami, ps, grep, find, or smsReport previews can auto-run without extra confirmation.",

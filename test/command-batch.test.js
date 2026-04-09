@@ -66,6 +66,22 @@ test("allows exact sudo read-only target-user checks in a batch", () => {
   assert.equal(batch.blockedCount, 0);
 });
 
+test("allows exact sudo target-user log discovery batches without confirmation", () => {
+  const batch = summarizeCommandBatchReviews(
+    [
+      "sudo -u gbuora find /scratch/wls -maxdepth 5 -type d \\( -name nmsdomain -o -name servers -o -name logs \\)",
+      "sudo -u gbuora bash -lc 'find /scratch/wls -maxdepth 7 -type f \\( -name \"*.log\" -o -name \"*.out\" \\) | grep \"/servers/.*/logs/\" | tail -40'",
+    ],
+    undefined,
+    TEST_POLICY,
+  );
+
+  assert.equal(batch.decision, "allow");
+  assert.equal(batch.requiresConfirmation, false);
+  assert.equal(batch.approvalRequiredCount, 0);
+  assert.equal(batch.blockedCount, 0);
+});
+
 test("preserves blocked decisions inside a batch", () => {
   const blockedPolicy = {
     ...TEST_POLICY,

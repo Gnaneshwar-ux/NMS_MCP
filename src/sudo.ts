@@ -4,7 +4,7 @@ import {
   type ShellPrivilegeMode,
   type ShellSession,
 } from "./session.js";
-import { stripAnsiPreserveWhitespace } from "./utils.js";
+import { HandledError, stripAnsiPreserveWhitespace } from "./utils.js";
 
 const MAX_SUDO_PROMPT_ATTEMPTS = 3;
 const SHELL_EXIT_PATTERN = /^\s*(?:exit|logout)\s*$/i;
@@ -21,8 +21,31 @@ export interface ShellIdentityTransition {
   sourceCommand: string;
 }
 
+export type TargetShellSwitchMethod = "sudo-su" | "sudo-iu";
+
+const SAFE_TARGET_USER_PATTERN = /^[A-Za-z0-9._-]+$/;
+
 function normalizeCommand(command: string): string {
   return command.replace(/\s+/g, " ").trim();
+}
+
+function normalizeTargetUser(targetUser: string): string {
+  const normalized = targetUser.trim();
+  if (!normalized) {
+    throw new HandledError(
+      "INVALID_ARGUMENT",
+      "targetUser is required and must be a non-empty string.",
+    );
+  }
+
+  if (!SAFE_TARGET_USER_PATTERN.test(normalized)) {
+    throw new HandledError(
+      "INVALID_ARGUMENT",
+      "targetUser contains unsupported characters. Use a plain Unix account name.",
+    );
+  }
+
+  return normalized;
 }
 
 function chooseHereDocDelimiter(value: string): string {
@@ -223,6 +246,25 @@ function inferSudoTransition(command: string): ShellIdentityTransition | null {
 
 export function inferShellIdentityTransition(command: string): ShellIdentityTransition | null {
   return inferSuTransition(command) ?? inferSudoTransition(command);
+}
+
+export function buildTargetShellSwitchCommand(
+  targetUser: string,
+  method: TargetShellSwitchMethod = "sudo-su",
+): string {
+  const normalizedTargetUser = normalizeTargetUser(targetUser);
+
+  switch (method) {
+    case "sudo-su":
+      return `sudo su - ${normalizedTargetUser}`;
+    case "sudo-iu":
+      return `sudo -iu ${normalizedTargetUser}`;
+    default:
+      throw new HandledError(
+        "INVALID_ARGUMENT",
+        `Unsupported target shell switch method "${String(method)}".`,
+      );
+  }
 }
 
 export function rewriteSudoCommandWithPassword(

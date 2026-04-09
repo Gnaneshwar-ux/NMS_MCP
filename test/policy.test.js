@@ -44,6 +44,32 @@ test("allows exact read-only sudo diagnostics for target-user execution", () => 
   assert.equal(review.riskLevel, "read-only");
 });
 
+test("allows exact sudo target-user directory discovery find diagnostics", () => {
+  const review = reviewCommandPolicy(
+    "sudo -u gbuora find /scratch/wls -maxdepth 5 -type d \\( -name nmsdomain -o -name servers -o -name logs \\)",
+    undefined,
+    TEST_POLICY,
+  );
+
+  assert.equal(review.decision, "allow");
+  assert.equal(review.requiresConfirmation, false);
+  assert.equal(review.safeForAutoRun, true);
+  assert.equal(review.category, "privileged-command");
+});
+
+test("allows exact sudo target-user log-path discovery bundles wrapped in bash -lc", () => {
+  const review = reviewCommandPolicy(
+    "sudo -u gbuora bash -lc 'find /scratch/wls -maxdepth 7 -type f \\( -name \"*.log\" -o -name \"*.out\" \\) | grep \"/servers/.*/logs/\" | tail -40'",
+    undefined,
+    TEST_POLICY,
+  );
+
+  assert.equal(review.decision, "allow");
+  assert.equal(review.requiresConfirmation, false);
+  assert.equal(review.safeForAutoRun, true);
+  assert.equal(review.category, "privileged-command");
+});
+
 test("allows exact read-only diagnostics bundles wrapped in bash -lc", () => {
   const review = reviewCommandPolicy(
     `bash -lc 'source ~/.nmsrc >/dev/null 2>&1; echo "=== host ==="; hostname; echo "=== user ==="; whoami; echo "=== smsReport ==="; smsReport 2>&1 | head -n 120; echo "=== key processes ==="; ps -ef | egrep "isis|JMS|genpublisher|ddservice|jmservice" | grep -v grep | head -n 80; echo "=== recent logs ==="; find ~/logs -maxdepth 1 -type f \\( -name "*.log" -o -name "*.out" \\) -printf "%TY-%Tm-%Td %TT %p\\n" 2>/dev/null | sort | tail -n 10'`,

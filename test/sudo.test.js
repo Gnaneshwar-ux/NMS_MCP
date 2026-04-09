@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 import { createFakeSession } from "./helpers.js";
 import {
+  buildTargetShellSwitchCommand,
   inferShellIdentityTransition,
   maybeInjectSudoPassword,
   rewriteSudoCommandWithPassword,
@@ -25,6 +26,11 @@ test("infers sudo login-shell transitions with explicit target user", () => {
   assert.equal(transition.expectedUser, "oracle");
   assert.equal(transition.privilegeMode, "sudo");
   assert.equal(transition.viaSudo, true);
+});
+
+test("builds a sudo-based target shell switch command", () => {
+  assert.equal(buildTargetShellSwitchCommand("oracle"), "sudo su - oracle");
+  assert.equal(buildTargetShellSwitchCommand("oracle", "sudo-iu"), "sudo -iu oracle");
 });
 
 test("infers root shell transitions for plain sudo -i", () => {

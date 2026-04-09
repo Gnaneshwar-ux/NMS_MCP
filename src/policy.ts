@@ -115,6 +115,18 @@ const SAFE_DIRECT_SEGMENT_PATTERNS: Array<{
     summary: "Exact grep-with-line-numbers diagnostic.",
   },
   {
+    regex:
+      /^(?!.*\b-(?:exec|execdir|ok|okdir|delete|fprint|fprintf|fls)\b)find\s+.+\s+-type\s+d\b[\s\S]*\s-(?:name|iname)\s+.+(?:\s+-o\s+-(?:name|iname)\s+.+)*(?:\s*\|\s*(?:head\s+-n\s+\d+|tail\s+(?:-n\s+)?-?\d+))?$/i,
+    category: "search-and-read",
+    summary: "Exact directory-discovery find diagnostic.",
+  },
+  {
+    regex:
+      /^(?!.*\b-(?:exec|execdir|ok|okdir|delete|fprint|fprintf|fls)\b)find\s+.+\s+-type\s+f\b[\s\S]*\s-(?:name|iname)\s+.+(?:\s+-o\s+-(?:name|iname)\s+.+)*(?:\s*\|\s*(?:grep|egrep|fgrep)\s+.+)+(?:\s*\|\s*(?:head\s+-n\s+\d+|tail\s+(?:-n\s+)?-?\d+))?$/i,
+    category: "log-read",
+    summary: "Exact log-path discovery find pipeline.",
+  },
+  {
     regex: /^find\s+.+\s+\|\s+sort(?:\s+.+)?\s+\|\s+tail\s+-n\s+\d+$/i,
     category: "search-and-read",
     summary: "Exact find/sort/tail diagnostic pipeline.",
@@ -1254,7 +1266,6 @@ export function reviewCommandPolicy(
     inspection.usesSudo &&
     !inspection.elevatesShell &&
     Boolean(sudoReadOnlySummary?.knownSafeAutoRun) &&
-    !inspection.hasShellWrapper &&
     !inspection.hasOpaqueInlineScript &&
     !inspection.hasHeredoc &&
     !inspection.hasWritableRedirection &&

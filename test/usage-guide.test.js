@@ -18,6 +18,7 @@ test("usage guide exposes preferred style and tool guidance", () => {
 
   const toolNames = new Set(guide.toolGuidance.map((entry) => entry.tool));
   assert.ok(toolNames.has("read_usage_guide"));
+  assert.ok(toolNames.has("ssh_connect_target_session"));
   assert.ok(toolNames.has("execute_command"));
   assert.ok(toolNames.has("execute_command_batch"));
   assert.ok(toolNames.has("list_nms_guides"));

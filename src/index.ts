@@ -58,7 +58,11 @@ import {
 import { maybeAdoptInteractiveShell } from "./shell-state.js";
 import { closeShellSession, connectShellSession, type AuthMethod } from "./ssh.js";
 import { reviewSqlPolicy } from "./sql-policy.js";
-import { inferShellIdentityTransition } from "./sudo.js";
+import {
+  buildTargetShellSwitchCommand,
+  inferShellIdentityTransition,
+  type TargetShellSwitchMethod,
+} from "./sudo.js";
 import { getUsageGuide } from "./usage-guide.js";
 import {
   analyzeInteractionPrompt,
@@ -114,7 +118,8 @@ const SHARED_CREDENTIAL_INPUTS = {
 const TOOL_DEFINITIONS = [
   {
     name: "ssh_connect",
-    description: "Establishes SSH connection and opens a PTY shell session.",
+    description:
+      "Establishes SSH connection and opens a PTY shell session. Use this when you need login-user context first or when the target user is not known yet. If later commands will mostly run as one non-root target user, prefer ssh_connect_target_session.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -137,9 +142,44 @@ const TOOL_DEFINITIONS = [
     },
   },
   {
+    name: "ssh_connect_target_session",
+    description:
+      "Establishes SSH connection and immediately adopts a non-root target-user shell in the same PTY session. This is the preferred NMS/WebLogic log-analysis path when the workflow is LDAP login plus one project/admin target user, because later commands can run directly without repeating sudo.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["host", "authMethod", "targetUser"],
+      properties: {
+        host: { type: "string" },
+        port: { type: "integer", default: 22 },
+        username: { type: "string" },
+        authMethod: {
+          type: "string",
+          enum: ["password", "privateKey", "agent"],
+        },
+        password: { type: "string" },
+        privateKey: { type: "string" },
+        passphrase: { type: "string" },
+        sessionLabel: { type: "string" },
+        connectTimeout: { type: "integer", default: 10000 },
+        targetUser: { type: "string" },
+        targetSwitchMethod: {
+          type: "string",
+          enum: ["sudo-su", "sudo-iu"],
+          default: "sudo-su",
+        },
+        timeout: { type: "integer", default: DEFAULT_COMMAND_TIMEOUT_MS },
+        waitForOutputMs: { type: "integer", default: 2500 },
+        stripAnsi: { type: "boolean", default: true },
+        sudoPassword: { type: "string" },
+        ...SHARED_CREDENTIAL_INPUTS,
+      },
+    },
+  },
+  {
     name: "execute_command",
     description:
-      "Executes a shell command in an existing PTY session. Only an explicit safe read-only list auto-runs. Any other command requires user confirmation first unless a deny rule or blocked category forbids it.",
+      "Executes one exact non-interactive shell command in an existing PTY session. Best for focused standalone diagnostics such as hostname, whoami, smsReport, grep -n, tail -n, ps, ss, or one find command. Prefer this over bash -lc bundles when one command is enough. Only an explicit safe read-only list auto-runs; anything else may require confirmation or be blocked.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -159,7 +199,7 @@ const TOOL_DEFINITIONS = [
   {
     name: "start_interactive_command",
     description:
-      "Starts a command inside the PTY session and keeps the interaction open so the agent can inspect prompts and send follow-up input safely.",
+      "Starts a command inside the PTY session and keeps the interaction open. Use this only for true interactive flows such as target-user shell adoption, SQL clients, tail -f, pagers, or prompt-driven tools. Avoid it for normal read-only diagnostics that fit execute_command or execute_command_batch.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -180,7 +220,7 @@ const TOOL_DEFINITIONS = [
   {
     name: "review_command",
     description:
-      "Reviews a command before execution and returns whether MCP can auto-run it, must ask the user first, or is blocked by explicit policy.",
+      "Reviews one exact command before execution and returns whether MCP can auto-run it, must ask first, or is blocked. Use this when you are unsure whether a command shape will trigger confirmation.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -194,7 +234,7 @@ const TOOL_DEFINITIONS = [
   {
     name: "review_command_batch",
     description:
-      "Reviews a related set of shell commands together and reports whether the whole batch can auto-run, needs one confirmation, or contains blocked commands.",
+      "Reviews a related list of exact standalone shell commands together and reports whether the whole batch can auto-run, needs one shared confirmation, or contains blocked commands. This is the preferred preview path for a human-style diagnostic checklist on one host.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -244,7 +284,7 @@ const TOOL_DEFINITIONS = [
   {
     name: "execute_command_batch",
     description:
-      "Executes a related set of shell commands sequentially in one session. MCP reviews them together so one confirmation can cover the whole batch when needed.",
+      "Executes a related list of exact standalone shell commands sequentially in one session. This is the preferred path for NMS and WebLogic diagnostics because MCP reviews the batch together and can use one shared confirmation when needed. Prefer several narrow commands here instead of one large shell wrapper.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -321,7 +361,7 @@ const TOOL_DEFINITIONS = [
   {
     name: "oracle_connect",
     description:
-      "Establishes a cached Oracle DB session for NMS diagnostics and query execution. Provide connectString, or provide host plus either serviceName or sid.",
+      "Establishes a cached Oracle DB session for NMS diagnostics and query execution. Prefer the read-only application schema when diagnosing behavior. Provide connectString, or provide host plus either serviceName or sid.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -348,7 +388,7 @@ const TOOL_DEFINITIONS = [
   {
     name: "execute_sql",
     description:
-      "Executes SQL in an existing cached Oracle DB session. Only explicit safe SELECT queries auto-run. Any other SQL requires user confirmation first unless a deny rule or blocked category forbids it.",
+      "Executes one SQL statement in an existing cached Oracle DB session. Best for one exact read-only SELECT or WITH ... SELECT statement at a time. Prefer small inspectable queries over multi-statement SQL. Only explicit safe read-only SQL auto-runs; anything else may require confirmation or be blocked.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -369,7 +409,7 @@ const TOOL_DEFINITIONS = [
   {
     name: "review_sql",
     description:
-      "Reviews SQL before execution and returns whether MCP can auto-run it, must ask the user first, or is blocked by explicit policy.",
+      "Reviews one SQL statement before execution and returns whether MCP can auto-run it, must ask first, or is blocked. Use this when the SQL is not an obviously safe single read-only query.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -419,7 +459,7 @@ const TOOL_DEFINITIONS = [
   {
     name: "read_usage_guide",
     description:
-      "Returns MCP-specific usage guidance, preferred tool-selection style, anti-patterns, and operator-style recommendations for this server.",
+      "Returns MCP-specific usage guidance, preferred tool-selection style, and anti-patterns for this server. Call this first when you are unsure how to structure commands for low-friction usage and fewer unnecessary confirmations.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -429,7 +469,7 @@ const TOOL_DEFINITIONS = [
   {
     name: "read_policy",
     description:
-      "Returns the active shell-command and SQL safety policies, including blocked categories, approval categories, and any configured allowlist or denylist rules.",
+      "Returns the active shell-command and SQL safety policies, including blocked categories, approval categories, and any configured allowlist or denylist rules. Use this when live confirmation or block behavior matters more than the generic usage guide.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -1443,6 +1483,10 @@ async function callSshConnect(args: Record<string, unknown>): Promise<Record<str
     sessionManager,
   });
 
+  return toShellSessionSummary(session);
+}
+
+function toShellSessionSummary(session: ShellSession): Record<string, unknown> {
   return {
     sessionId: session.id,
     host: session.host,
@@ -1464,6 +1508,195 @@ async function callSshConnect(args: Record<string, unknown>): Promise<Record<str
     },
     ...(session.serverBanner ? { serverBanner: session.serverBanner } : {}),
   };
+}
+
+function readTargetSwitchMethod(args: Record<string, unknown>): TargetShellSwitchMethod {
+  const method = readString(args, "targetSwitchMethod") ?? "sudo-su";
+  if (method !== "sudo-su" && method !== "sudo-iu") {
+    throw new HandledError(
+      "INVALID_ARGUMENT",
+      'targetSwitchMethod must be one of "sudo-su" or "sudo-iu".',
+    );
+  }
+
+  return method;
+}
+
+async function callSshConnectTargetSession(
+  args: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  const host = readString(args, "host", true) ?? "";
+  const port = readPositiveInteger(args, "port", 22);
+  const authMethod = readAuthMethod(args);
+  const credentials = resolveSshCredentials(args, authMethod);
+  const sessionLabel = readString(args, "sessionLabel");
+  const connectTimeout = readPositiveInteger(args, "connectTimeout", 10_000);
+  const targetUser = readString(args, "targetUser", true) ?? "";
+  const targetSwitchMethod = readTargetSwitchMethod(args);
+  const timeoutMs = readPositiveInteger(args, "timeout", DEFAULT_COMMAND_TIMEOUT_MS);
+  const waitForOutputMs = readPositiveInteger(args, "waitForOutputMs", 2500);
+  const sudoPassword = resolveSudoPassword(args);
+  const stripAnsi = readBoolean(args, "stripAnsi", true);
+
+  const session = await connectShellSession({
+    host,
+    port,
+    username: credentials.username,
+    authMethod,
+    password: credentials.password,
+    privateKey: credentials.privateKey,
+    passphrase: credentials.passphrase,
+    sessionLabel,
+    connectTimeout,
+    sessionManager,
+  });
+
+  if (session.identity.effectiveUser === targetUser) {
+    return {
+      ...toShellSessionSummary(session),
+      targetUser,
+      targetSwitchMethod,
+      targetSwitchCommand: null,
+      targetShellAdopted: true,
+      targetSwitchSkipped: true,
+      interaction: buildInteractionState(session, stripAnsi),
+    };
+  }
+
+  const targetSwitchCommand = buildTargetShellSwitchCommand(targetUser, targetSwitchMethod);
+
+  return await runExclusiveShellOperation(
+    session,
+    "ssh_connect_target_session",
+    async () => {
+      const policy = ensureCommandApproval(session, targetSwitchCommand, undefined, undefined);
+
+      sessionManager.recordAudit({
+        level: "info",
+        event: "command_started",
+        message: `Started ${policy.riskLevel} interactive command execution.`,
+        sessionId: session.id,
+        host: session.host,
+        username: session.username,
+        command: targetSwitchCommand,
+        riskLevel: policy.riskLevel,
+        details: {
+          category: policy.category,
+          timeoutMs,
+          waitForOutputMs,
+          confirmationUsed: false,
+          executionMode: "interactive",
+          initializer: true,
+          targetUser,
+          targetSwitchMethod,
+        },
+      });
+
+      try {
+        const result = await startInteractiveCommand(session, targetSwitchCommand, {
+          timeoutMs,
+          waitForOutputMs,
+          sudoPassword,
+          stripAnsiOutput: stripAnsi,
+        });
+        const interaction = buildInteractionState(session, stripAnsi);
+        const targetShellAdopted =
+          !result.completed &&
+          !session.activeCommand &&
+          session.ready &&
+          session.identity.effectiveUser === targetUser;
+
+        if (targetShellAdopted) {
+          sessionManager.recordAudit({
+            level: "info",
+            event: "command_completed",
+            message: `Adopted target-user shell as ${targetUser}.`,
+            sessionId: session.id,
+            host: session.host,
+            username: session.username,
+            command: targetSwitchCommand,
+            riskLevel: policy.riskLevel,
+            details: {
+              category: policy.category,
+              executionMs: result.executionMs,
+              executionMode: "interactive",
+              initializer: true,
+              targetUser,
+              targetSwitchMethod,
+              targetShellAdopted,
+            },
+          });
+
+          return {
+            ...toShellSessionSummary(session),
+            targetUser,
+            targetSwitchMethod,
+            targetSwitchCommand,
+            targetShellAdopted,
+            targetSwitchOutput: result.stdout,
+            interaction,
+          };
+        }
+
+        const recovery = session.activeCommand
+          ? await interruptSession(session, {
+              signal: "ctrlC",
+              waitForReadyMs: Math.max(500, Math.min(waitForOutputMs, 2_000)),
+              clearBuffer: false,
+            })
+          : null;
+        const recoveredInteraction = buildInteractionState(session, stripAnsi);
+        const message = result.completed
+          ? "Connected to the host, but the target-user shell switch exited before MCP could adopt it."
+          : "Connected to the host, but MCP could not finish adopting the target-user shell.";
+
+        throw new HandledError("TARGET_SESSION_INIT_FAILED", message, {
+          sessionId: session.id,
+          host: session.host,
+          username: session.username,
+          targetUser,
+          targetSwitchMethod,
+          targetSwitchCommand,
+          targetSwitchOutput: result.stdout,
+          interaction,
+          recovery,
+          recoveredInteraction,
+          sessionIdentity: {
+            loginUser: session.identity.loginUser,
+            effectiveUser: session.identity.effectiveUser,
+            privilegeMode: session.identity.privilegeMode,
+            promptMarkerActive: session.identity.promptMarkerActive,
+            source: session.identity.source,
+          },
+        });
+      } catch (error) {
+        if (error instanceof HandledError) {
+          error.details["interaction"] = buildInteractionState(session, stripAnsi);
+
+          sessionManager.recordAudit({
+            level: "error",
+            event: "command_failed",
+            message: error.message,
+            sessionId: session.id,
+            host: session.host,
+            username: session.username,
+            command: targetSwitchCommand,
+            riskLevel: policy.riskLevel,
+            details: {
+              category: policy.category,
+              executionMode: "interactive",
+              initializer: true,
+              targetUser,
+              targetSwitchMethod,
+              ...error.details,
+            },
+          });
+        }
+
+        throw error;
+      }
+    },
+  );
 }
 
 async function callExecuteCommand(
@@ -2674,6 +2907,8 @@ function buildServer() {
     switch (toolName) {
       case "ssh_connect":
         return await safeToolCall(() => callSshConnect(args));
+      case "ssh_connect_target_session":
+        return await safeToolCall(() => callSshConnectTargetSession(args));
       case "execute_command":
         return await safeToolCall(() => callExecuteCommand(args));
       case "start_interactive_command":

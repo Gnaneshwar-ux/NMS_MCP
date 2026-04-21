@@ -96,6 +96,8 @@ const SAFE_DIRECT_SEGMENT_PATTERNS: Array<{
   { regex: /^hostname$/i, category: "server-state", summary: "Exact hostname diagnostic." },
   { regex: /^whoami$/i, category: "identity-read", summary: "Exact current-user diagnostic." },
   { regex: /^id$/i, category: "identity-read", summary: "Exact user and group identity diagnostic." },
+  { regex: /^pwd$/i, category: "identity-read", summary: "Exact current-directory diagnostic." },
+  { regex: /^command\s+-v\s+[A-Za-z0-9._-]+$/i, category: "identity-read", summary: "Exact command lookup diagnostic." },
   { regex: /^getent\s+passwd\s+[A-Za-z0-9._-]+$/i, category: "account-read", summary: "Exact getent passwd lookup." },
   { regex: /^getent\s+group\s+[A-Za-z0-9._-]+$/i, category: "account-read", summary: "Exact getent group lookup." },
   { regex: /^ss\s+-ltn$/i, category: "network-read", summary: "Exact listening TCP socket diagnostic." },
@@ -125,6 +127,12 @@ const SAFE_DIRECT_SEGMENT_PATTERNS: Array<{
       /^(?!.*\b-(?:exec|execdir|ok|okdir|delete|fprint|fprintf|fls)\b)find\s+.+\s+-type\s+f\b[\s\S]*\s-(?:name|iname)\s+.+(?:\s+-o\s+-(?:name|iname)\s+.+)*(?:\s*\|\s*(?:grep|egrep|fgrep)\s+.+)+(?:\s*\|\s*(?:head\s+-n\s+\d+|tail\s+(?:-n\s+)?-?\d+))?$/i,
     category: "log-read",
     summary: "Exact log-path discovery find pipeline.",
+  },
+  {
+    regex:
+      /^(?!.*\b-(?:exec|execdir|ok|okdir|delete|fprint|fprintf|fls)\b)find\s+.+\s+-type\s+f\b[\s\S]*\s-(?:name|iname)\s+.+(?:\s+-o\s+-(?:name|iname)\s+.+)*(?:\s*\|\s*sort(?:\s+.+)?)?(?:\s*\|\s*(?:head\s+-n\s+\d+|tail\s+(?:-n\s+)?-?\d+))?$/i,
+    category: "log-read",
+    summary: "Exact file-discovery find diagnostic.",
   },
   {
     regex: /^find\s+.+\s+\|\s+sort(?:\s+.+)?\s+\|\s+tail\s+-n\s+\d+$/i,
@@ -1213,7 +1221,11 @@ function decideCommandPolicy(
   if (autoAllowPermitted) {
     return {
       decision: "allow",
-      decisionReason: "Built-in policy allows this exact known-safe read-only diagnostic command without confirmation.",
+      decisionReason: input.safePrivilegeTransitionAutoRun
+        ? "Built-in policy allows this exact sudo-based target-user handoff without confirmation."
+        : input.safeSudoReadOnlyAutoRun
+          ? "Built-in policy allows this exact read-only sudo diagnostic without confirmation."
+          : "Built-in policy allows this exact known-safe read-only diagnostic command without confirmation.",
     };
   }
 

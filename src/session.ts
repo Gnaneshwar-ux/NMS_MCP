@@ -55,6 +55,7 @@ export interface AuditEntry {
 export interface ActiveCommandState {
   command: string;
   submittedCommand: string;
+  submissionMode: "wrapped" | "raw";
   executionMode: "oneshot" | "interactive";
   sentinelId: string;
   startedAt: number;
@@ -124,6 +125,7 @@ export interface ShellSession {
   operationChain?: Promise<void>;
   activeCommand?: ActiveCommandState;
   pendingApproval?: PendingApproval;
+  preferredSudoPassword?: string;
 }
 
 const REDACTED_SECRET = "<redacted>";
@@ -234,6 +236,20 @@ export function recordShellBootstrapFailure(
 export function recordShellAdoption(session: ShellSession): void {
   session.bootstrap = {
     ...session.bootstrap,
+    adoptedShellCount: session.bootstrap.adoptedShellCount + 1,
+  };
+}
+
+export function recordVerifiedShellAdoption(
+  session: ShellSession,
+  reason: string,
+): void {
+  session.bootstrap = {
+    ...session.bootstrap,
+    successful: true,
+    lastBootstrapAt: Date.now(),
+    lastBootstrapReason: reason,
+    lastBootstrapError: undefined,
     adoptedShellCount: session.bootstrap.adoptedShellCount + 1,
   };
 }

@@ -104,18 +104,70 @@ test("injects the sudo password only once for the same visible prompt", () => {
   assert.equal(activeCommand.sudoPromptAttempts, 1);
 });
 
-test("rewrites direct sudo commands to use sudo -S when a password is supplied", () => {
+test("re-injects only after the previous visible prompt cycle has cleared", () => {
+  const { session, writes } = createFakeSession();
+  const activeCommand = {
+    command: "sudo -k ls /root",
+    submittedCommand: "sudo -k ls /root\n",
+    executionMode: "oneshot",
+    sentinelId: "sentinel",
+    startedAt: Date.now(),
+    timeoutMs: 30_000,
+    buffer: "[sudo] password for test: ",
+    sudoPassword: "Oracle1234",
+    sudoPromptAttempts: 0,
+    lastSudoPromptBufferLength: 0,
+    lastSudoPromptSignature: undefined,
+    completed: false,
+    timedOutReported: false,
+    stripAnsiOutput: true,
+  };
+
+  maybeInjectSudoPassword(session, activeCommand);
+  maybeInjectSudoPassword(session, activeCommand);
+
+  activeCommand.buffer = "sorry, try again.\n";
+  maybeInjectSudoPassword(session, activeCommand);
+
+  activeCommand.buffer += "[sudo] password for test: ";
+  maybeInjectSudoPassword(session, activeCommand);
+
+  assert.deepEqual(writes, ["Oracle1234\n", "Oracle1234\n"]);
+  assert.equal(activeCommand.sudoPromptAttempts, 2);
+});
+
+test("injects a stored password for generic password prompts too", () => {
+  const { session, writes } = createFakeSession();
+  const activeCommand = {
+    command: "su - oracle",
+    submittedCommand: "su - oracle\n",
+    executionMode: "interactive",
+    sentinelId: "sentinel",
+    startedAt: Date.now(),
+    timeoutMs: 30_000,
+    buffer: "Password: ",
+    sudoPassword: "Oracle1234",
+    sudoPromptAttempts: 0,
+    lastSudoPromptBufferLength: 0,
+    lastSudoPromptSignature: undefined,
+    completed: false,
+    timedOutReported: false,
+    stripAnsiOutput: true,
+  };
+
+  maybeInjectSudoPassword(session, activeCommand);
+  assert.deepEqual(writes, ["Oracle1234\n"]);
+  assert.equal(activeCommand.sudoPromptAttempts, 1);
+});
+
+test("keeps direct sudo commands intact and uses prompt injection when a password is supplied", () => {
   const result = rewriteSudoCommandWithPassword(
     "sudo -k ls /root | head -n 5",
     "Oracle1234",
   );
 
-  assert.equal(result.usesPromptInjection, false);
-  assert.match(
-    result.rewrittenCommand,
-    /^cat <<'__MCP_SUDO_PASSWORD__' \| sudo -S -p '' -k ls \/root \| head -n 5\nOracle1234\n__MCP_SUDO_PASSWORD__$/,
-  );
-  assert.doesNotMatch(result.rewrittenCommand, /printf '%s\\n'/);
+  assert.equal(result.usesPromptInjection, true);
+  assert.equal(result.rewrittenCommand, "sudo -k ls /root | head -n 5");
 });
 
 test("keeps shell-elevating sudo flows on prompt injection", () => {
@@ -128,15 +180,12 @@ test("keeps shell-elevating sudo flows on prompt injection", () => {
   assert.equal(result.rewrittenCommand, "sudo -iu oracle");
 });
 
-test("rewrites one-shot sudo bash -lc commands to use sudo -S", () => {
+test("keeps one-shot sudo bash -lc commands intact and uses prompt injection", () => {
   const result = rewriteSudoCommandWithPassword(
     "sudo -iu oracle bash -lc 'whoami'",
     "Oracle1234",
   );
 
-  assert.equal(result.usesPromptInjection, false);
-  assert.match(
-    result.rewrittenCommand,
-    /^cat <<'__MCP_SUDO_PASSWORD__' \| sudo -S -p '' -iu oracle bash -lc 'whoami'\nOracle1234\n__MCP_SUDO_PASSWORD__$/,
-  );
+  assert.equal(result.usesPromptInjection, true);
+  assert.equal(result.rewrittenCommand, "sudo -iu oracle bash -lc 'whoami'");
 });

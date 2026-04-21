@@ -5,6 +5,7 @@ import { createFakeSession } from "./helpers.js";
 import {
   bootstrapShell,
   maybeAdoptInteractiveShell,
+  reconcileShellIdentity,
 } from "../dist/shell-state.js";
 
 function extractReadyMarker(input) {
@@ -104,4 +105,48 @@ test("does not adopt when the interactive shell has not reached a prompt yet", a
   assert.equal(result.adopted, false);
   assert.equal(session.activeCommand?.command, "su - nmsadmin");
   assert.equal(session.identity.effectiveUser, "test");
+});
+
+test("reconciles shell identity after the prompt is already back", async () => {
+  const { session, writes } = createFakeSession({
+    ready: true,
+    buffer: "Last login: Tue Apr 21 13:58:55 UTC 2026 on pts/1\n$ ",
+    identity: {
+      loginUser: "gnagurra",
+      effectiveUser: "gnagurra",
+      privilegeMode: "standard",
+      promptMarkerActive: false,
+      source: "login",
+      lastDetectedAt: Date.now(),
+    },
+    onWrite(input, activeSession) {
+      const readyMarker = extractReadyMarker(input);
+      if (!readyMarker) {
+        return;
+      }
+
+      setTimeout(() => {
+        activeSession.buffer += `\n${readyMarker}|gbuora\n__MCP_PROMPT__ `;
+      }, 0);
+    },
+  });
+
+  const result = await reconcileShellIdentity(
+    session,
+    1_000,
+    "target-session reconciliation",
+    {
+      adoptsShell: true,
+      expectedUser: "gbuora",
+      privilegeMode: "sudo",
+      viaSudo: true,
+      sourceCommand: "sudo su - gbuora",
+    },
+  );
+
+  assert.ok(result);
+  assert.equal(result.effectiveUser, "gbuora");
+  assert.equal(session.identity.effectiveUser, "gbuora");
+  assert.equal(session.identity.privilegeMode, "sudo");
+  assert.equal(writes.length, 1);
 });

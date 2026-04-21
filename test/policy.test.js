@@ -138,6 +138,40 @@ test("allows bare smsReport as an exact read-only NMS diagnostic", () => {
   assert.equal(review.riskLevel, "read-only");
 });
 
+test("allows bare pwd as an exact read-only diagnostic", () => {
+  const review = reviewCommandPolicy("pwd", undefined, TEST_POLICY);
+
+  assert.equal(review.decision, "allow");
+  assert.equal(review.requiresConfirmation, false);
+  assert.equal(review.safeForAutoRun, true);
+  assert.equal(review.category, "identity-read");
+  assert.equal(review.riskLevel, "read-only");
+});
+
+test("allows command -v lookups as exact read-only diagnostics", () => {
+  const review = reviewCommandPolicy("command -v sqlplus", undefined, TEST_POLICY);
+
+  assert.equal(review.decision, "allow");
+  assert.equal(review.requiresConfirmation, false);
+  assert.equal(review.safeForAutoRun, true);
+  assert.equal(review.category, "identity-read");
+  assert.equal(review.riskLevel, "read-only");
+});
+
+test("allows exact find and sort file-discovery diagnostics", () => {
+  const review = reviewCommandPolicy(
+    "find /scratch/wls -maxdepth 7 -type f \\( -name \"*.log\" -o -name \"*.out\" \\) | sort | tail -n 10",
+    undefined,
+    TEST_POLICY,
+  );
+
+  assert.equal(review.decision, "allow");
+  assert.equal(review.requiresConfirmation, false);
+  assert.equal(review.safeForAutoRun, true);
+  assert.equal(review.category, "log-read");
+  assert.equal(review.riskLevel, "read-only");
+});
+
 test("allows known-safe read-only commands inside an already elevated session", () => {
   const { session } = createFakeSession({
     isSudo: true,
@@ -213,16 +247,12 @@ test("requires confirmation for heredoc-wrapped inline scripts", () => {
   assert.equal(review.knownSafeAutoRun, false);
 });
 
-test("drops sudo non-interactive flags when a password is supplied", () => {
+test("keeps sudo commands intact and uses prompt injection when a password is supplied", () => {
   const result = rewriteSudoCommandWithPassword(
     "sudo -n -u esb8 bash -lc 'whoami'",
     "Oracle1234",
   );
 
-  assert.equal(result.usesPromptInjection, false);
-  assert.doesNotMatch(result.rewrittenCommand, /\s-n(?=\s|$)/);
-  assert.match(
-    result.rewrittenCommand,
-    /^cat <<'__MCP_SUDO_PASSWORD__' \| sudo -S -p '' -u esb8 bash -lc 'whoami'\nOracle1234\n__MCP_SUDO_PASSWORD__$/,
-  );
+  assert.equal(result.usesPromptInjection, true);
+  assert.equal(result.rewrittenCommand, "sudo -n -u esb8 bash -lc 'whoami'");
 });

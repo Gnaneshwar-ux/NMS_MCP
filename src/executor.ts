@@ -2,6 +2,7 @@ import { maybeAdoptInteractiveShell } from "./shell-state.js";
 import { setSessionIdentity, type ShellSession } from "./session.js";
 
 import {
+  inferShellIdentityTransition,
   maybeInjectSudoPassword,
   rewriteSudoCommandWithPassword,
   updateSessionSudoState,
@@ -103,13 +104,21 @@ function beginCommand(
   const sentinelId = generateSentinel();
   const startedAt = Date.now();
   const preparedCommand = rewriteSudoCommandWithPassword(command, options.sudoPassword);
-  const submittedCommand = buildWrappedCommand(preparedCommand.rewrittenCommand, sentinelId);
+  const submissionMode =
+    options.executionMode === "interactive" && inferShellIdentityTransition(command)
+      ? "raw"
+      : "wrapped";
+  const submittedCommand =
+    submissionMode === "raw"
+      ? `${preparedCommand.rewrittenCommand}\n`
+      : buildWrappedCommand(preparedCommand.rewrittenCommand, sentinelId);
 
   session.recentBuffer = "";
 
   session.activeCommand = {
     command,
     submittedCommand,
+    submissionMode,
     executionMode: options.executionMode,
     sentinelId,
     startedAt,
@@ -154,7 +163,25 @@ function maybeFinalizeActiveCommand(session: ShellSession): void {
     return;
   }
 
+  if (!activeCommand.sudoPassword && session.preferredSudoPassword) {
+    activeCommand.sudoPassword = session.preferredSudoPassword;
+  }
+
   maybeInjectSudoPassword(session, activeCommand);
+
+  if (activeCommand.submissionMode === "raw") {
+    if (activeCommand.timedOutReported && detectShellPrompt(session.buffer)) {
+      session.activeCommand = undefined;
+      session.ready = true;
+      session.manualMode = false;
+      setSessionIdentity(session, {
+        promptMarkerActive: hasPromptMarker(session.buffer),
+        source: session.identity.source,
+      });
+    }
+
+    return;
+  }
 
   const sentinelPattern = new RegExp(`${escapeRegExp(activeCommand.sentinelId)}_(\\d+)`);
   const match = activeCommand.buffer.match(sentinelPattern);

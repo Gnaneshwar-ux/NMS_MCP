@@ -8,8 +8,10 @@ import { HandledError, stripAnsiPreserveWhitespace } from "./utils.js";
 
 const MAX_SUDO_PROMPT_ATTEMPTS = 3;
 const SHELL_EXIT_PATTERN = /^\s*(?:exit|logout)\s*$/i;
-const SUDO_PROMPT_AT_END_PATTERNS = [
+const PASSWORD_PROMPT_AT_END_PATTERNS = [
   /\[sudo\] password(?: for [^:\n]+)?:\s*$/i,
+  /\bpassword(?: for [^:\n]+)?:\s*$/i,
+  /\bpassphrase(?: for [^:\n]+)?:\s*$/i,
   /password for [^:\n]+:\s*$/i,
 ];
 
@@ -46,77 +48,6 @@ function normalizeTargetUser(targetUser: string): string {
   }
 
   return normalized;
-}
-
-function chooseHereDocDelimiter(value: string): string {
-  let delimiter = "__MCP_SUDO_PASSWORD__";
-  while (
-    value === delimiter ||
-    value.startsWith(`${delimiter}\n`) ||
-    value.endsWith(`\n${delimiter}`) ||
-    value.includes(`\n${delimiter}\n`)
-  ) {
-    delimiter = `${delimiter}_X`;
-  }
-
-  return delimiter;
-}
-
-const SUDO_OPTIONS_WITH_VALUE = new Set([
-  "-g",
-  "-h",
-  "-p",
-  "-r",
-  "-t",
-  "-u",
-  "-C",
-  "-T",
-  "--chdir",
-  "--close-from",
-  "--group",
-  "--host",
-  "--prompt",
-  "--role",
-  "--type",
-  "--user",
-]);
-
-function stripNonInteractiveSudoFlags(commandRemainder: string): string {
-  const tokens = normalizeCommand(commandRemainder)
-    .split(" ")
-    .map((token) => token.trim())
-    .filter(Boolean);
-  const rewrittenTokens: string[] = [];
-
-  for (let index = 0; index < tokens.length; index += 1) {
-    const token = tokens[index] ?? "";
-    const lowerToken = token.toLowerCase();
-
-    if (token === "-n" || lowerToken === "--non-interactive") {
-      continue;
-    }
-
-    if (token === "--") {
-      rewrittenTokens.push(...tokens.slice(index));
-      break;
-    }
-
-    if (!token.startsWith("-")) {
-      rewrittenTokens.push(...tokens.slice(index));
-      break;
-    }
-
-    rewrittenTokens.push(token);
-    if (SUDO_OPTIONS_WITH_VALUE.has(token) || SUDO_OPTIONS_WITH_VALUE.has(lowerToken)) {
-      const nextToken = tokens[index + 1];
-      if (nextToken) {
-        rewrittenTokens.push(nextToken);
-        index += 1;
-      }
-    }
-  }
-
-  return rewrittenTokens.join(" ");
 }
 
 function tokenize(command: string): string[] {
@@ -281,23 +212,9 @@ export function rewriteSudoCommandWithPassword(
     };
   }
 
-  const sudoPrefixPattern =
-    /^\s*((?:[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|[^\s]+)\s+)*)sudo\b/i;
-  const sudoPrefixMatch = command.match(sudoPrefixPattern);
-  if (!sudoPrefixMatch) {
-    return {
-      rewrittenCommand: command,
-      usesPromptInjection: Boolean(sudoPassword),
-    };
-  }
-
-  const envPrefix = sudoPrefixMatch[1] ?? "";
-  const rest = stripNonInteractiveSudoFlags(command.slice(sudoPrefixMatch[0].length));
-  const delimiter = chooseHereDocDelimiter(sudoPassword);
-
   return {
-    rewrittenCommand: `cat <<'${delimiter}' | ${envPrefix}sudo -S -p '' ${rest}\n${sudoPassword}\n${delimiter}`,
-    usesPromptInjection: false,
+    rewrittenCommand: command,
+    usesPromptInjection: true,
   };
 }
 
@@ -310,17 +227,16 @@ export function maybeInjectSudoPassword(
   }
 
   const strippedTail = stripAnsiPreserveWhitespace(activeCommand.buffer).slice(-256);
-  const promptMatch = SUDO_PROMPT_AT_END_PATTERNS.map((pattern) => strippedTail.match(pattern)).find(Boolean);
+  const promptMatch = PASSWORD_PROMPT_AT_END_PATTERNS.map((pattern) => strippedTail.match(pattern)).find(Boolean);
   const promptSignature = promptMatch?.[0]?.trim();
 
   if (!promptSignature) {
+    activeCommand.lastSudoPromptSignature = undefined;
+    activeCommand.lastSudoPromptBufferLength = activeCommand.buffer.length;
     return;
   }
 
-  if (
-    activeCommand.buffer.length === activeCommand.lastSudoPromptBufferLength &&
-    activeCommand.lastSudoPromptSignature === promptSignature
-  ) {
+  if (activeCommand.lastSudoPromptSignature === promptSignature) {
     return;
   }
 

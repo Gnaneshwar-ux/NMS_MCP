@@ -34,6 +34,28 @@ export interface ShellAdoptionResult {
   adoptionError?: string;
 }
 
+export async function reconcileShellIdentity(
+  session: ShellSession,
+  timeoutMs: number,
+  reason: string,
+  transition?: ShellIdentityTransition | null,
+): Promise<ShellBootstrapResult | null> {
+  if (session.closed || session.activeCommand || !detectShellPrompt(session.buffer)) {
+    return null;
+  }
+
+  try {
+    return await bootstrapShell(
+      session,
+      Math.max(500, Math.min(timeoutMs, 3_000)),
+      reason,
+      transition,
+    );
+  } catch {
+    return null;
+  }
+}
+
 function createReadyMarker(): string {
   return `${SHELL_READY_MARKER_PREFIX}${Date.now()}_${Math.floor(Math.random() * 1000)}`;
 }

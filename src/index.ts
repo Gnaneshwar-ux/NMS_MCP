@@ -50,15 +50,17 @@ import {
 } from "./policy-config.js";
 import { reviewCommandPolicy } from "./policy.js";
 import {
+  recordVerifiedShellAdoption,
   SessionManager,
   runExclusiveShellOperation,
   type PendingApproval,
   type ShellSession,
 } from "./session.js";
-import { maybeAdoptInteractiveShell } from "./shell-state.js";
+import { maybeAdoptInteractiveShell, reconcileShellIdentity } from "./shell-state.js";
 import { closeShellSession, connectShellSession, type AuthMethod } from "./ssh.js";
 import { reviewSqlPolicy } from "./sql-policy.js";
 import {
+  applyInteractiveShellIdentityTransition,
   buildTargetShellSwitchCommand,
   inferShellIdentityTransition,
   type TargetShellSwitchMethod,
@@ -165,7 +167,7 @@ const TOOL_DEFINITIONS = [
         targetUser: { type: "string" },
         targetSwitchMethod: {
           type: "string",
-          enum: ["sudo-su", "sudo-iu"],
+          enum: ["sudo-su", "sudo-iu", "sudo su -", "sudo -iu", "sudo su", "su -"],
           default: "sudo-su",
         },
         timeout: { type: "integer", default: DEFAULT_COMMAND_TIMEOUT_MS },
@@ -747,6 +749,24 @@ function normalizeApprovalText(value: string): string {
   return value.replace(/\s+/g, " ").trim();
 }
 
+function rememberSessionSudoPassword(
+  session: ShellSession,
+  ...candidates: Array<string | undefined>
+): void {
+  const value = candidates.find((candidate) => typeof candidate === "string" && candidate.trim().length > 0);
+  if (value) {
+    session.preferredSudoPassword = value;
+  }
+}
+
+function resolveSessionSudoPassword(
+  session: ShellSession,
+  explicitPassword?: string,
+): string | undefined {
+  rememberSessionSudoPassword(session, explicitPassword);
+  return explicitPassword ?? session.preferredSudoPassword;
+}
+
 function toPendingApprovalSummary(pendingApproval?: PendingApproval): Record<string, unknown> | null {
   if (!pendingApproval) {
     return null;
@@ -817,6 +837,20 @@ function toCommandReviewSummary(review: {
     decision: review.decision,
     safeForAutoRun: review.safeForAutoRun,
   };
+}
+
+function summarizeBatchResultsForError(
+  results: Array<Record<string, unknown>>,
+): Array<Record<string, unknown>> {
+  return results.map((result) => ({
+    command: result["command"] ?? null,
+    index: result["index"] ?? null,
+    stdout: result["stdout"] ?? null,
+    exitCode: result["exitCode"] ?? null,
+    timedOut: result["timedOut"] ?? null,
+    policy: result["policy"] ?? null,
+    error: result["error"] ?? null,
+  }));
 }
 
 function ensureCommandApproval(
@@ -1125,22 +1159,25 @@ function buildInteractionState(
 
   let safeToAutoRespond = prompt.safeToAutoRespond;
   const autoResponseSent =
-    prompt.promptType === "sudo_password" &&
+    (prompt.promptType === "sudo_password" || prompt.promptType === "password") &&
     Boolean(activeCommand?.sudoPassword) &&
     (activeCommand?.sudoPromptAttempts ?? 0) > 0;
 
-  if (prompt.promptType === "sudo_password" && activeCommand?.sudoPassword) {
+  if (
+    (prompt.promptType === "sudo_password" || prompt.promptType === "password") &&
+    activeCommand?.sudoPassword
+  ) {
     if (autoResponseSent) {
       safeToAutoRespond = false;
       suggestedInputs.unshift({
         input: "",
-        description: "The server already submitted the provided sudo password. Wait for more output before sending anything else.",
+        description: "The server already submitted the provided password. Wait for more output before sending anything else.",
       });
     } else {
       safeToAutoRespond = true;
       suggestedInputs.unshift({
-        input: "<provided sudo password>\\n",
-        description: "Submit the sudo password supplied with the active command.",
+        input: "<provided password>\\n",
+        description: "Submit the password supplied with the active command.",
         sensitive: true,
       });
     }
@@ -1467,6 +1504,7 @@ async function callSshConnect(args: Record<string, unknown>): Promise<Record<str
   const port = readPositiveInteger(args, "port", 22);
   const authMethod = readAuthMethod(args);
   const credentials = resolveSshCredentials(args, authMethod);
+  const sudoPassword = resolveSudoPassword(args);
   const sessionLabel = readString(args, "sessionLabel");
   const connectTimeout = readPositiveInteger(args, "connectTimeout", 10_000);
 
@@ -1482,6 +1520,7 @@ async function callSshConnect(args: Record<string, unknown>): Promise<Record<str
     connectTimeout,
     sessionManager,
   });
+  rememberSessionSudoPassword(session, sudoPassword, credentials.password);
 
   return toShellSessionSummary(session);
 }
@@ -1511,11 +1550,23 @@ function toShellSessionSummary(session: ShellSession): Record<string, unknown> {
 }
 
 function readTargetSwitchMethod(args: Record<string, unknown>): TargetShellSwitchMethod {
-  const method = readString(args, "targetSwitchMethod") ?? "sudo-su";
+  const method = (readString(args, "targetSwitchMethod") ?? "sudo-su")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ");
+
+  if (method === "sudo-su" || method === "sudo su -" || method === "sudo su" || method === "su -") {
+    return "sudo-su";
+  }
+
+  if (method === "sudo-iu" || method === "sudo -iu") {
+    return "sudo-iu";
+  }
+
   if (method !== "sudo-su" && method !== "sudo-iu") {
     throw new HandledError(
       "INVALID_ARGUMENT",
-      'targetSwitchMethod must be one of "sudo-su" or "sudo-iu".',
+      'targetSwitchMethod must be one of "sudo-su", "sudo-iu", "sudo su -", or "sudo -iu".',
     );
   }
 
@@ -1535,7 +1586,8 @@ async function callSshConnectTargetSession(
   const targetSwitchMethod = readTargetSwitchMethod(args);
   const timeoutMs = readPositiveInteger(args, "timeout", DEFAULT_COMMAND_TIMEOUT_MS);
   const waitForOutputMs = readPositiveInteger(args, "waitForOutputMs", 2500);
-  const sudoPassword = resolveSudoPassword(args);
+  const targetSwitchOutputWaitMs = Math.min(waitForOutputMs, 1_500);
+  const providedSudoPassword = resolveSudoPassword(args);
   const stripAnsi = readBoolean(args, "stripAnsi", true);
 
   const session = await connectShellSession({
@@ -1550,6 +1602,7 @@ async function callSshConnectTargetSession(
     connectTimeout,
     sessionManager,
   });
+  rememberSessionSudoPassword(session, providedSudoPassword, credentials.password);
 
   if (session.identity.effectiveUser === targetUser) {
     return {
@@ -1583,7 +1636,7 @@ async function callSshConnectTargetSession(
         details: {
           category: policy.category,
           timeoutMs,
-          waitForOutputMs,
+          waitForOutputMs: targetSwitchOutputWaitMs,
           confirmationUsed: false,
           executionMode: "interactive",
           initializer: true,
@@ -1595,16 +1648,62 @@ async function callSshConnectTargetSession(
       try {
         const result = await startInteractiveCommand(session, targetSwitchCommand, {
           timeoutMs,
-          waitForOutputMs,
-          sudoPassword,
+          waitForOutputMs: targetSwitchOutputWaitMs,
+          sudoPassword: resolveSessionSudoPassword(session, providedSudoPassword),
           stripAnsiOutput: stripAnsi,
         });
-        const interaction = buildInteractionState(session, stripAnsi);
-        const targetShellAdopted =
+        await waitForPotentialShellAdoption(
+          session,
+          Math.min(timeoutMs, Math.max(targetSwitchOutputWaitMs, 1_500)),
+        );
+        let targetShellAdopted =
           !result.completed &&
           !session.activeCommand &&
           session.ready &&
           session.identity.effectiveUser === targetUser;
+        let recovery: { sessionReady: boolean; clearedActiveCommand: boolean } | null = null;
+
+        if (!targetShellAdopted && session.activeCommand) {
+          recovery = await interruptSession(session, {
+            signal: "ctrlC",
+            waitForReadyMs: Math.max(500, Math.min(targetSwitchOutputWaitMs, 1_500)),
+            clearBuffer: false,
+          });
+        }
+
+        if (!targetShellAdopted) {
+          const transition = inferShellIdentityTransition(targetSwitchCommand);
+          await reconcileShellIdentity(
+            session,
+            Math.min(timeoutMs, Math.max(targetSwitchOutputWaitMs, 1_500)),
+            `target-session reconciliation for ${targetSwitchCommand}`,
+            transition,
+          );
+          targetShellAdopted =
+            !session.activeCommand &&
+            session.ready &&
+            session.identity.effectiveUser === targetUser;
+
+          if (!targetShellAdopted && !session.activeCommand && session.ready) {
+            const verification = await executeCommand(session, "whoami", {
+              timeoutMs: Math.min(timeoutMs, 2_000),
+              stripAnsiOutput: true,
+            });
+
+            if (verification.stdout.trim() === targetUser) {
+              if (transition) {
+                applyInteractiveShellIdentityTransition(session, transition, verification.stdout.trim());
+              }
+              recordVerifiedShellAdoption(
+                session,
+                `verified target-shell adoption for ${targetSwitchCommand}`,
+              );
+              targetShellAdopted = true;
+            }
+          }
+        }
+
+        const interaction = buildInteractionState(session, stripAnsi);
 
         if (targetShellAdopted) {
           sessionManager.recordAudit({
@@ -1638,13 +1737,6 @@ async function callSshConnectTargetSession(
           };
         }
 
-        const recovery = session.activeCommand
-          ? await interruptSession(session, {
-              signal: "ctrlC",
-              waitForReadyMs: Math.max(500, Math.min(waitForOutputMs, 2_000)),
-              clearBuffer: false,
-            })
-          : null;
         const recoveredInteraction = buildInteractionState(session, stripAnsi);
         const message = result.completed
           ? "Connected to the host, but the target-user shell switch exited before MCP could adopt it."
@@ -1705,12 +1797,13 @@ async function callExecuteCommand(
   const sessionId = readString(args, "sessionId", true) ?? "";
   const command = readString(args, "command", true) ?? "";
   const timeoutMs = readPositiveInteger(args, "timeout", DEFAULT_COMMAND_TIMEOUT_MS);
-  const sudoPassword = resolveSudoPassword(args);
+  const providedSudoPassword = resolveSudoPassword(args);
   const stripAnsi = readBoolean(args, "stripAnsi", true);
   const approvalId = readString(args, "approvalId");
   const userConfirmation = readString(args, "userConfirmation");
   const session = sessionManager.require(sessionId);
   return await runExclusiveShellOperation(session, "execute_command", async () => {
+    const sudoPassword = resolveSessionSudoPassword(session, providedSudoPassword);
     const policy = ensureCommandApproval(session, command, approvalId, userConfirmation);
 
     sessionManager.recordAudit({
@@ -1797,12 +1890,13 @@ async function callStartInteractiveCommand(
   const command = readString(args, "command", true) ?? "";
   const timeoutMs = readPositiveInteger(args, "timeout", DEFAULT_COMMAND_TIMEOUT_MS);
   const waitForOutputMs = readPositiveInteger(args, "waitForOutputMs", 1500);
-  const sudoPassword = resolveSudoPassword(args);
+  const providedSudoPassword = resolveSudoPassword(args);
   const stripAnsi = readBoolean(args, "stripAnsi", true);
   const approvalId = readString(args, "approvalId");
   const userConfirmation = readString(args, "userConfirmation");
   const session = sessionManager.require(sessionId);
   return await runExclusiveShellOperation(session, "start_interactive_command", async () => {
+    const sudoPassword = resolveSessionSudoPassword(session, providedSudoPassword);
     const policy = ensureCommandApproval(session, command, approvalId, userConfirmation);
 
     sessionManager.recordAudit({
@@ -1830,6 +1924,7 @@ async function callStartInteractiveCommand(
         sudoPassword,
         stripAnsiOutput: stripAnsi,
       });
+      const adoption = await waitForPotentialShellAdoption(session, waitForOutputMs);
       const interaction = buildInteractionState(session, stripAnsi);
 
       if (result.completed) {
@@ -1853,7 +1948,8 @@ async function callStartInteractiveCommand(
 
       return {
         ...result,
-        shellAdopted: !result.completed && !session.activeCommand && session.ready,
+        shellAdopted:
+          adoption.adopted || (!result.completed && !session.activeCommand && session.ready),
         interaction,
         policy: {
           riskLevel: policy.riskLevel,
@@ -2081,7 +2177,7 @@ async function callExecuteCommandBatch(
   const sessionId = readString(args, "sessionId", true) ?? "";
   const commands = readStringArray(args, "commands", true);
   const timeoutMs = readPositiveInteger(args, "timeout", DEFAULT_COMMAND_TIMEOUT_MS);
-  const sudoPassword = resolveSudoPassword(args);
+  const providedSudoPassword = resolveSudoPassword(args);
   const stripAnsi = readBoolean(args, "stripAnsi", true);
   const approvalId = readString(args, "approvalId");
   const userConfirmation = readString(args, "userConfirmation");
@@ -2089,6 +2185,7 @@ async function callExecuteCommandBatch(
   const session = sessionManager.require(sessionId);
 
   return await runExclusiveShellOperation(session, "execute_command_batch", async () => {
+    const sudoPassword = resolveSessionSudoPassword(session, providedSudoPassword);
     const policy = ensureCommandBatchApproval(session, commands, approvalId, userConfirmation);
     const results: Array<Record<string, unknown>> = [];
     let stoppedEarly = false;
@@ -2200,7 +2297,7 @@ async function callExecuteCommandBatch(
         }
       } catch (error) {
         if (error instanceof HandledError) {
-          error.details["batchResults"] = results;
+          error.details["batchResults"] = summarizeBatchResultsForError(results);
           error.details["failedCommand"] = command;
           error.details["failedCommandIndex"] = index;
           error.details["batchSize"] = commands.length;

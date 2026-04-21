@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 
 import { createFakeSession } from "./helpers.js";
 import { HandledError } from "../dist/utils.js";
-import { SessionManager } from "../dist/session.js";
+import { recordVerifiedShellAdoption, SessionManager } from "../dist/session.js";
 
 function createActiveCommand() {
   return {
@@ -115,4 +115,27 @@ test("session manager masks secret-like audit fields", () => {
   } finally {
     manager.dispose();
   }
+});
+
+test("verified shell adoption clears stale bootstrap errors and updates counters", () => {
+  const { session } = createFakeSession({
+    bootstrap: {
+      successful: false,
+      lastBootstrapReason: "target-session reconciliation",
+      lastBootstrapError: "Timed out waiting for bootstrap",
+      recoveryCount: 0,
+      adoptedShellCount: 0,
+    },
+  });
+
+  recordVerifiedShellAdoption(session, "verified target-shell adoption for sudo -iu esb8");
+
+  assert.equal(session.bootstrap.successful, true);
+  assert.equal(session.bootstrap.lastBootstrapError, undefined);
+  assert.equal(
+    session.bootstrap.lastBootstrapReason,
+    "verified target-shell adoption for sudo -iu esb8",
+  );
+  assert.equal(session.bootstrap.adoptedShellCount, 1);
+  assert.ok(typeof session.bootstrap.lastBootstrapAt === "number");
 });

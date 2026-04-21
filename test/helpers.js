@@ -41,6 +41,7 @@ export function createFakeSession(options = {}) {
     },
     activeCommand: options.activeCommand,
     pendingApproval: options.pendingApproval,
+    preferredSudoPassword: options.preferredSudoPassword,
   };
 
   return {
